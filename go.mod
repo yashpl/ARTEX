@@ -61,4 +61,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/Autumn-27/norma => github.com/yashpl/Norma v0.0.0-20261117160442-facbfad0e8dc
+replace github.com/Autumn-27/norma => github.com/yashpl/Norma v0.0.0-20261119151123-ac459dcc7035
