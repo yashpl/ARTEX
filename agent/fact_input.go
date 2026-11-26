@@ -7,7 +7,9 @@ import (
 )
 
 // Match strings.TrimSpace, including Unicode whitespace, in the published schema.
-const factWhitespace = "\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
+// Use \t\n\x0b\x0c\r escapes (not raw control bytes or \v/\f) so both RE2 and
+// llama.cpp/Ollama GBNF grammar parsers accept the regex cleanly.
+const factWhitespace = "\\t\\n\\x0b\\x0c\\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
 
 func factAssetIDSchema() map[string]any {
 	return map[string]any{
@@ -29,7 +31,7 @@ func factItemSchema() map[string]any {
 	}, "summary")
 	summary := schema["properties"].(map[string]any)["summary"].(map[string]any)
 	summary["minLength"] = 1
-	summary["pattern"] = "^[\\s\\S]*[^" + factWhitespace + "][\\s\\S]*$"
+	summary["pattern"] = "^[" + factWhitespace + "]*[^" + factWhitespace + "](.|\\n)*$"
 	schema["additionalProperties"] = false
 	return schema
 }
