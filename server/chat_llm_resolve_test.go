@@ -14,9 +14,9 @@ import (
 func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := New(ctx, m, td, td, td)
@@ -66,9 +66,9 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := New(ctx, m, td, td, td)

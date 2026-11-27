@@ -442,6 +442,51 @@ func TestQueryHostPortAndURLForms(t *testing.T) {
 	}
 }
 
+// TestQueryHostDefaultPort covers captures of default-port targets: clients
+// leave :80 and :443 out of the Host header, so the recorded URL carries no
+// port, and a search naming that port must still find them.
+func TestQueryHostDefaultPort(t *testing.T) {
+	tr, _ := openTraffic(t)
+	tls := newFlow("x", "GET", "/", nil, []byte("tls"))
+	tls.Request.URL, _ = url.Parse("https://shop.example.com/login")
+	tr.record(tls)
+	tr.record(newFlow("shop.example.com", "GET", "/plain", nil, []byte("plain")))
+	tr.record(newFlow("shop.example.com:8443", "GET", "/alt", nil, []byte("alt")))
+	v6 := newFlow("x", "GET", "/", nil, []byte("v6"))
+	v6.Request.URL, _ = url.Parse("https://[2001:db8::1]/admin")
+	tr.record(v6)
+	ws := newFlow("x", "GET", "/", nil, nil)
+	ws.Request.URL, _ = url.Parse("https://chat.example.com/socket")
+	if _, err := tr.recordStreamStart(flowRequestView(ws.Request), responseView{}, "websocket", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		host string
+		want string
+	}{
+		{host: "shop.example.com:443", want: "https://shop.example.com/login"},
+		{host: "https://shop.example.com:443/login", want: "https://shop.example.com/login"},
+		{host: "shop.example.com:80", want: "http://shop.example.com/plain"},
+		{host: "http://shop.example.com:80/", want: "http://shop.example.com/plain"},
+		{host: "shop.example.com:8443", want: "http://shop.example.com:8443/alt"},
+		{host: "[2001:db8::1]:443", want: "https://[2001:db8::1]/admin"},
+		{host: "chat.example.com:443", want: "wss://chat.example.com/socket"},
+	} {
+		rows, err := tr.query(tc.host, "", "", 0, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].URL != tc.want {
+			var got []string
+			for _, r := range rows {
+				got = append(got, r.URL)
+			}
+			t.Errorf("query(%q) = %v, want [%s]", tc.host, got, tc.want)
+		}
+	}
+}
+
 func TestNormalizeSearchHost(t *testing.T) {
 	for _, tc := range []struct {
 		raw, host, port string
@@ -524,5 +569,120 @@ func TestRecordConcurrent(t *testing.T) {
 	}
 	if exchanges != n || bodies != n {
 		t.Fatalf("after concurrent writes exchanges=%d bodies=%d, want %d each", exchanges, bodies, n)
+	}
+}
+
+func TestTrafficPageRewrittenFlagAndFilter(t *testing.T) {
+	tr, _ := openTraffic(t)
+	insertEx := func(id string, ts int64, host string, status int) {
+		t.Helper()
+		if _, err := tr.DB().Exec(`INSERT INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, ts, host, "GET", "/p/"+id, "https://"+host+"/p/"+id, status, "text/plain", 0, 10, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	insertEx("rw-a-200", 1, "alpha.example", 200)
+	insertEx("rw-b-404", 2, "beta.example", 404)
+	insertEx("orig-a-200", 3, "alpha.example", 200)
+	insertEx("skip-a-404", 4, "alpha.example", 404)
+	insertEx("err-b-200", 5, "beta.example", 200)
+
+	if _, err := tr.DB().Exec(`INSERT INTO exchange_rewrites(exchange_id,seq,phase,rule_id,outcome) VALUES
+('rw-a-200',0,'request',1,'applied'),
+('rw-b-404',0,'response',2,'applied'),
+('skip-a-404',0,'request',3,'skipped'),
+('err-b-200',0,'response',4,'error')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default ("") and "all" return all 5 with accurate Rewritten flags.
+	for _, filter := range []string{"", RewriteFilterAll} {
+		rows, total, err := tr.Page(PageQuery{Rewritten: filter, RespMin: -1, RespMax: -1}, 0, 20)
+		if err != nil || total != 5 || len(rows) != 5 {
+			t.Fatalf("filter=%q got (%d, total=%d, err=%v), want (5, 5, nil)", filter, len(rows), total, err)
+		}
+		got := map[string]bool{}
+		for _, r := range rows {
+			got[r.ID] = r.Rewritten
+		}
+		if !got["rw-a-200"] || !got["rw-b-404"] || got["orig-a-200"] || got["skip-a-404"] || got["err-b-200"] {
+			t.Fatalf("filter=%q flags = %v", filter, got)
+		}
+	}
+
+	// Rewritten filter (canonical + true alias).
+	for _, filter := range []string{RewriteFilterRewritten, "true"} {
+		rows, total, err := tr.Page(PageQuery{Rewritten: filter, RespMin: -1, RespMax: -1}, 0, 20)
+		if err != nil || total != 2 || len(rows) != 2 {
+			t.Fatalf("filter=%q got (%d, total=%d, err=%v), want (2, 2, nil)", filter, len(rows), total, err)
+		}
+		for _, r := range rows {
+			if !r.Rewritten {
+				t.Fatalf("filter=%q returned non-rewritten row %s", filter, r.ID)
+			}
+		}
+	}
+
+	// Original filter (canonical + false alias) includes plain, skipped-only, and error-only.
+	for _, filter := range []string{RewriteFilterOriginal, "false"} {
+		rows, total, err := tr.Page(PageQuery{Rewritten: filter, RespMin: -1, RespMax: -1}, 0, 20)
+		if err != nil || total != 3 || len(rows) != 3 {
+			t.Fatalf("filter=%q got (%d, total=%d, err=%v), want (3, 3, nil)", filter, len(rows), total, err)
+		}
+		for _, r := range rows {
+			if r.Rewritten {
+				t.Fatalf("filter=%q returned rewritten row %s", filter, r.ID)
+			}
+		}
+	}
+
+	// Combined with host + status and pagination.
+	rows, total, err := tr.Page(PageQuery{Host: "alpha", Status: "200", Rewritten: RewriteFilterRewritten, RespMin: -1, RespMax: -1}, 0, 10)
+	if err != nil || total != 1 || len(rows) != 1 || rows[0].ID != "rw-a-200" {
+		t.Fatalf("combined host+status+rewritten = (%+v, total=%d, err=%v)", rows, total, err)
+	}
+	p0, total0, err := tr.Page(PageQuery{Rewritten: RewriteFilterOriginal, RespMin: -1, RespMax: -1}, 0, 2)
+	p1, total1, err2 := tr.Page(PageQuery{Rewritten: RewriteFilterOriginal, RespMin: -1, RespMax: -1}, 1, 2)
+	if err != nil || err2 != nil || total0 != 3 || total1 != 3 || len(p0) != 2 || len(p1) != 1 {
+		t.Fatalf("pagination original p0=(%d/%d,%v) p1=(%d/%d,%v)", len(p0), total0, err, len(p1), total1, err2)
+	}
+
+	// Search also carries Rewritten.
+	srows, err := tr.Search("alpha.example", 0, 10)
+	if err != nil || len(srows) != 3 {
+		t.Fatalf("Search = (%d, %v), want (3, nil)", len(srows), err)
+	}
+	found := map[string]bool{}
+	for _, r := range srows {
+		found[r.ID] = r.Rewritten
+	}
+	if !found["rw-a-200"] || found["orig-a-200"] || found["skip-a-404"] {
+		t.Fatalf("Search rewritten flags = %v", found)
+	}
+}
+
+// TestPageHostsAllowlist pins the company-scope filter: an exact host allowlist
+// keeps only those hosts (the substring Host filter stays independent), and
+// MatchNone forces an empty result for a company that owns no host.
+func TestPageHostsAllowlist(t *testing.T) {
+	tr, _ := openTraffic(t)
+	tr.record(newFlow("api.example.com", "GET", "/a", nil, []byte("a")))
+	tr.record(newFlow("api.other.example", "GET", "/b", nil, []byte("b")))
+	tr.record(newFlow("shop.example.com", "GET", "/c", nil, []byte("c")))
+
+	rows, total, err := tr.Page(PageQuery{Hosts: []string{"api.example.com", "shop.example.com"}, RespMin: -1, RespMax: -1}, 0, 100)
+	if err != nil || total != 2 || len(rows) != 2 {
+		t.Fatalf("allowlist should keep 2 rows, got total=%d rows=%d err=%v", total, len(rows), err)
+	}
+	// Exact match: api.other.example is not api.example.com.
+	if rows, _, err := tr.Page(PageQuery{Hosts: []string{"api.example.com"}, RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 {
+		t.Fatalf("exact allowlist should keep 1 row, got %d err=%v", len(rows), err)
+	}
+	if _, total, err := tr.Page(PageQuery{MatchNone: true, RespMin: -1, RespMax: -1}, 0, 100); err != nil || total != 0 {
+		t.Fatalf("MatchNone should match nothing, got total=%d err=%v", total, err)
+	}
+	if _, total, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1}, 0, 100); err != nil || total != 3 {
+		t.Fatalf("no filter should return all 3, got %d err=%v", total, err)
 	}
 }

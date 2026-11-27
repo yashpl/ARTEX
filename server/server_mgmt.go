@@ -4,13 +4,16 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -18,6 +21,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"text/template"
 	"text/template/parse"
 	"time"
@@ -26,6 +31,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/notify"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
@@ -80,10 +86,18 @@ func pathInt(r *http.Request, name string) (int64, bool) {
 	return n, err == nil
 }
 
-// decodeMaxBytes is the default JSON body cap. Multipart uploads are not capped
-// here; those handlers set their own limit. A smaller MaxBytesReader installed
-// by a handler still wins, because it sits inside this one.
+// decodeMaxBytes is the default JSON body cap. Multipart uploads get the larger
+// maxMultipartBodyBytes here instead; the upload handlers set their own,
+// tighter limit. A smaller MaxBytesReader installed by a handler still wins,
+// because it sits inside this one.
 const decodeMaxBytes = 32 << 20
+
+// maxMultipartBodyBytes caps any request that declares a multipart Content-Type.
+// It is the largest limit an upload handler sets (chat attachments; workspace
+// uploads and skill zips are smaller), so no real upload is refused, while a
+// handler that decodes JSON straight from r.Body can no longer be handed an
+// unbounded body just by labelling the request multipart.
+const maxMultipartBodyBytes = maxChatUpload + chatUploadMultipartOverhead
 
 // limitedBody records a MaxBytesError so a later 400 can be answered as 413.
 type limitedBody struct {
@@ -122,10 +136,17 @@ func (b *bodyLimitWriter) Unwrap() http.ResponseWriter { return b.ResponseWriter
 
 // limitRequestBody caps a non-multipart body at decodeMaxBytes and passes the
 // real ResponseWriter into MaxBytesReader. A handler that then answers 400 for
-// that read is rewritten to 413.
+// that read is rewritten to 413. A multipart body gets the plain upload-sized
+// cap instead: it is not a limitedBody, so decode still applies the JSON cap
+// if a JSON handler receives it, and upload handlers keep their own messages.
 func limitRequestBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Body == nil || r.Body == http.NoBody || isMultipart(r) {
+		if r.Body == nil || r.Body == http.NoBody {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isMultipart(r) {
+			r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodyBytes)
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -201,7 +222,7 @@ func (s *Server) abortTaskDelete(taskID string) {
 			state := task.lifecycleSnapshot()
 			keepPaused = state.Paused || state.Queued
 			if getErr != nil {
-				log.Printf("[task-delete] task %s failed to read persisted state, restoring the barrier from in-memory state: %v", taskID, getErr)
+				slog.Warn("[task-delete] failed to read persisted state, restoring barrier from in-memory state", "task_id", taskID, "err", getErr)
 			}
 		} else if getErr == nil {
 			// The request targeted a task that does not exist. Do not retain a
@@ -355,7 +376,7 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	// starter prompt so the editor shows something editable from the start.
 	if err := pg.SeedPromptIfEmpty(a.ID, agent.DefaultAssistantPrompt); err != nil {
-		log.Printf("[agents] failed to seed starter prompt for %s: %v", a.Key, err)
+		slog.Error("[agents] failed to seed starter prompt", "agent", a.Key, "err", err)
 	}
 	writeJSON(w, 200, agentDTO(a))
 }
@@ -403,10 +424,10 @@ func (s *Server) pgDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := pg.RemoveAgentFromToolBindings(a.Key); err != nil {
-		log.Printf("[agents] failed to clean up tool bindings for %s: %v", a.Key, err)
+		slog.Error("[agents] failed to clean up tool bindings", "agent", a.Key, "err", err)
 	}
 	if err := pg.DeleteTriggersForAgent(a.Key); err != nil {
-		log.Printf("[agents] failed to clean up triggers for %s: %v", a.Key, err)
+		slog.Error("[agents] failed to clean up triggers", "agent", a.Key, "err", err)
 	}
 	writeJSON(w, 200, map[string]any{"deleted": a.Key})
 }
@@ -844,7 +865,7 @@ func (s *Server) pgListTools(w http.ResponseWriter, r *http.Request) {
 	// catalog query, so agent assembly never pays for this aggregate.
 	counts, countErr := pg.ToolUsageCounts()
 	if countErr != nil {
-		log.Printf("[tools] failed to read call stats: %v", countErr)
+		slog.Warn("[tools] failed to read call stats", "err", countErr)
 	} else {
 		for _, tool := range ts {
 			tool.Calls = counts[tool.Key]
@@ -1065,7 +1086,7 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		m.ID = id
 		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 		if derr := s.discoverAndCacheMCP(ctx, &m); derr != nil {
-			log.Printf("[mcp] tool discovery after adding %s failed: %v", m.Name, derr)
+			slog.Error("[mcp] tool discovery failed after adding mcp", "mcp", m.Name, "err", derr)
 		}
 		cancel()
 	}
@@ -1156,7 +1177,7 @@ type skillFileNode struct {
 
 func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 	_ = os.MkdirAll(s.skillDir, 0o755)
-	allReg, _ := skill.LoadDir(s.skillDir)
+	allReg, _ := loadSkillsConfined(s.skillDir)
 	metaByDir := map[string]skill.Skill{}
 	if allReg != nil {
 		for _, sk := range allReg.List() {
@@ -1167,7 +1188,7 @@ func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := os.ReadDir(s.skillDir)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	// Usage is best-effort decoration: a ledger read failure leaves the counts at
@@ -1176,7 +1197,7 @@ func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 	if s.m.pg != nil {
 		stats, err := s.m.pg.SkillStats()
 		if err != nil {
-			log.Printf("[skills] failed to read call stats: %v", err)
+			slog.Warn("[skills] failed to read call stats", "err", err)
 		}
 		for _, st := range stats {
 			statBySkill[st.Skill] = st
@@ -1221,7 +1242,8 @@ func (s *Server) fsSkillUsage(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	calls, err := pg.RecentSkillCalls(name, limit)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		slog.Error("[skills] failed to read recent calls", "skill", name, "err", err)
+		writeErr(w, 500, "failed to load skill usage")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"calls": calls})
@@ -1237,7 +1259,8 @@ func (s *Server) fsMissingSkills(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	missing, err := pg.MissingSkillStats(limit)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		slog.Error("[skills] failed to read missing stats", "err", err)
+		writeErr(w, 500, "failed to load missing skills")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"missing": missing})
@@ -1275,13 +1298,18 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "description is required")
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, body.Name)
-	if _, err := os.Stat(skillPath); err == nil {
+	dirCP, err := resolveSkillDir(s.skillDir, body.Name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if dirCP.exists {
 		writeErr(w, 409, "skill already exists")
 		return
 	}
+	skillPath := filepath.Join(s.skillDir, body.Name)
 	if err := os.MkdirAll(skillPath, 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	// Build a spec-compliant SKILL.md (agentskills.io format):
@@ -1317,7 +1345,7 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := os.WriteFile(filepath.Join(skillPath, "SKILL.md"), []byte(sb.String()), 0o644); err != nil {
 		_ = os.RemoveAll(skillPath)
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	// Verify with the real parser: a description containing ": " (or any value that
@@ -1352,10 +1380,22 @@ func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillMD := filepath.Join(s.skillDir, name, "SKILL.md")
-	raw, err := os.ReadFile(skillMD)
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, "SKILL.md")
 	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists || !cp.exists {
 		writeErr(w, 404, "skill not found")
+		return
+	}
+	raw, err := os.ReadFile(cp.realPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeErr(w, 404, "skill not found")
+			return
+		}
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	updated, err := rewriteSkillFrontmatter(raw, body.MCPs, body.Description, body.License, body.Compatibility)
@@ -1363,8 +1403,8 @@ func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := os.WriteFile(skillMD, updated, 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+	if err := os.WriteFile(cp.realPath, updated, 0o644); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1383,9 +1423,9 @@ func yamlScalar(s string) string {
 // verifySkillFile re-loads a written SKILL.md with the real skill parser and
 // asserts the name and the mcps list survived the round trip.
 func verifySkillFile(skillPath, wantName string, wantMCPs []string) error {
-	reg, err := skill.LoadDir(skillPath)
+	reg, err := loadSkillsConfined(skillPath)
 	if err != nil {
-		return fmt.Errorf("load: %w", err)
+		return fmt.Errorf("load: %s", safeFSErr(err))
 	}
 	for _, s := range reg.List() {
 		if s.Dir == "" {
@@ -1399,14 +1439,14 @@ func verifySkillFile(skillPath, wantName string, wantMCPs []string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("no skill loaded from %s", skillPath)
+	return fmt.Errorf("no skill loaded from %s", filepath.Base(skillPath))
 }
 
 // warnBrokenSkills logs skills whose parsed name does not match their directory
 // name: the signature of frontmatter that failed to parse and silently fell back
 // (fields empty, mcps gate lost). Best-effort, startup only.
 func warnBrokenSkills(dir string) {
-	reg, err := skill.LoadDir(dir)
+	reg, err := loadSkillsConfined(dir)
 	if err != nil {
 		return
 	}
@@ -1414,7 +1454,7 @@ func warnBrokenSkills(dir string) {
 		if s.Dir == "" || s.Name == filepath.Base(s.Dir) {
 			continue
 		}
-		log.Printf("[skill] %s: frontmatter did not parse (loaded under the directory name; description and mcps are empty) - fix the YAML in %s", s.Name, filepath.Join(s.Dir, "SKILL.md"))
+		slog.Warn("[skill] frontmatter did not parse (loaded under directory name; fix YAML in SKILL.md)", "skill", s.Name, "path", filepath.Join(s.Dir, "SKILL.md"))
 	}
 }
 
@@ -1601,9 +1641,14 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dirCP, err := resolveSkillDir(s.skillDir, name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
 	skillPath := filepath.Join(s.skillDir, name)
 	overwrite := r.URL.Query().Get("overwrite") == "true"
-	if _, err := os.Stat(skillPath); err == nil && !overwrite {
+	if dirCP.exists && !overwrite {
 		writeErr(w, 409, "skill already exists: "+name+" (retry after confirming if you want to overwrite)")
 		return
 	}
@@ -1708,13 +1753,20 @@ func (s *Server) fsDeleteSkill(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid skill name")
 		return
 	}
+	dirCP, err := resolveSkillDir(s.skillDir, name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
 	if err := pg.DeleteSkillVisibility(name); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if err := os.RemoveAll(filepath.Join(s.skillDir, name)); err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	if dirCP.exists {
+		if err := os.RemoveAll(dirCP.entryPath); err != nil {
+			writeErr(w, 500, safeFSErr(err))
+			return
+		}
 	}
 	writeJSON(w, 200, map[string]any{"deleted": name})
 }
@@ -1816,14 +1868,23 @@ func (s *Server) fsListFiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid skill name")
 		return
 	}
-	dirPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+	dirCP, err := resolveSkillDir(s.skillDir, name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !dirCP.exists {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	files, err := walkSkillFiles(dirPath)
+	fi, err := os.Stat(dirCP.realPath)
+	if err != nil || !fi.IsDir() {
+		writeErr(w, 404, "skill not found")
+		return
+	}
+	files, err := walkSkillFiles(dirCP.realPath)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	if files == nil {
@@ -1843,13 +1904,22 @@ func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(s.skillDir, name, file))
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists || !cp.exists {
+		writeErr(w, 404, "file not found")
+		return
+	}
+	data, err := os.ReadFile(cp.realPath)
 	if os.IsNotExist(err) {
 		writeErr(w, 404, "file not found")
 		return
 	}
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"content": string(data), "file": file})
@@ -1873,19 +1943,26 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	fullPath := filepath.Join(skillPath, file)
-	// create parent subdirectory if needed (e.g. scripts/, references/, assets/)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+	if cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
 		return
 	}
-	if err := os.WriteFile(fullPath, []byte(body.Content), 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+	// create parent subdirectory if needed (e.g. scripts/, references/, assets/)
+	if err := os.MkdirAll(filepath.Dir(cp.realPath), 0o755); err != nil {
+		writeErr(w, 500, safeFSErr(err))
+		return
+	}
+	if err := os.WriteFile(cp.realPath, []byte(body.Content), 0o644); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1909,13 +1986,21 @@ func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, dir)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	if err := os.MkdirAll(filepath.Join(skillPath, dir), 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+	if cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if err := os.MkdirAll(cp.realPath, 0o755); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 201, map[string]any{"dir": dir})
@@ -1932,13 +2017,21 @@ func (s *Server) fsDeletePath(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	fullPath := filepath.Join(s.skillDir, name, file)
-	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists || !cp.exists {
 		writeErr(w, 404, "not found")
 		return
 	}
-	if err := os.RemoveAll(fullPath); err != nil {
-		writeErr(w, 500, err.Error())
+	if cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if err := os.RemoveAll(cp.entryPath); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": file})
@@ -1953,7 +2046,8 @@ func (s *Server) pgSkillVisibility(w http.ResponseWriter, r *http.Request) {
 	}
 	agents, err := pg.SkillAgents(r.PathValue("name"))
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		slog.Error("[skills] failed to read visibility", "skill", r.PathValue("name"), "err", err)
+		writeErr(w, 500, "failed to load skill visibility")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"agents": idStrings(agents)})
@@ -1974,7 +2068,8 @@ func (s *Server) pgToggleSkillVisibility(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := pg.ToggleSkillVisibility(body.AgentID, body.SkillName, body.Visible); err != nil {
-		writeErr(w, 500, err.Error())
+		slog.Error("[skills] failed to toggle visibility", "skill", body.SkillName, "err", err)
+		writeErr(w, 500, "failed to update skill visibility")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -2045,8 +2140,16 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// would get wrong — legacy/partial clients that never send it stay streaming.
 	var body struct {
 		db.LLMProfile
-		APIKey    string `json:"api_key"`
-		Streaming *bool  `json:"streaming"`
+		APIKey             string `json:"api_key"`
+		CustomHeaders      string `json:"custom_headers"`
+		ClearCustomHeaders bool   `json:"clear_custom_headers"`
+		Streaming          *bool  `json:"streaming"`
+		// Prices shadow the embedded fields so an omitted one keeps the stored
+		// value instead of resetting it to 0 (every save rewrites all four).
+		PriceInputPerM      *float64 `json:"price_input_per_m"`
+		PriceOutputPerM     *float64 `json:"price_output_per_m"`
+		PriceCacheReadPerM  *float64 `json:"price_cache_read_per_m"`
+		PriceCacheWritePerM *float64 `json:"price_cache_write_per_m"`
 	}
 	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
@@ -2054,6 +2157,35 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
+	p.CustomHeaders = body.CustomHeaders
+	p.ClearCustomHeaders = body.ClearCustomHeaders
+	if p.Format == "bedrock-gateway" {
+		if _, err := agent.ParseBedrockGatewayHeaders(p.CustomHeaders); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		if p.ID != 0 {
+			stored, err := pg.ProfileByID(p.ID)
+			if err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			if stored != nil && !sameLLMEndpoint(p.Format, p.BaseURL, stored.Format, stored.BaseURL) {
+				if strings.TrimSpace(p.APIKey) == "" {
+					writeErr(w, 400, "enter the bearer token when changing the Bedrock gateway endpoint")
+					return
+				}
+				if p.CustomHeaders == "" {
+					p.ClearCustomHeaders = true
+				}
+			}
+		}
+	} else if p.CustomHeaders != "" {
+		writeErr(w, 400, "custom headers require the Bedrock gateway format")
+		return
+	} else {
+		p.ClearCustomHeaders = true
+	}
 	p.Streaming = body.Streaming == nil || *body.Streaming
 	// The list returns the proxy masked: the placeholder sent back keeps the
 	// stored proxy and is never stored itself.
@@ -2071,6 +2203,32 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if p.MaxTokens < 0 {
 		p.MaxTokens = 0
 	}
+	var stored *db.LLMProfile
+	if p.ID != 0 && (body.PriceInputPerM == nil || body.PriceOutputPerM == nil || body.PriceCacheReadPerM == nil || body.PriceCacheWritePerM == nil) {
+		var err error
+		if stored, err = pg.ProfileByID(p.ID); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	var old db.LLMProfile
+	if stored != nil {
+		old = *stored
+	}
+	price := func(in, out *float64, kept float64) {
+		switch {
+		case in != nil:
+			*out = max(*in, 0)
+		case stored != nil:
+			*out = kept
+		default:
+			*out = 0
+		}
+	}
+	price(body.PriceInputPerM, &p.PriceInputPerM, old.PriceInputPerM)
+	price(body.PriceOutputPerM, &p.PriceOutputPerM, old.PriceOutputPerM)
+	price(body.PriceCacheReadPerM, &p.PriceCacheReadPerM, old.PriceCacheReadPerM)
+	price(body.PriceCacheWritePerM, &p.PriceCacheWritePerM, old.PriceCacheWritePerM)
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
 	}
@@ -2082,6 +2240,25 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.UserAgent = ua
+	if p.Format == "bedrock-gateway" {
+		validate := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+		validate.CustomHeaders = p.CustomHeaders
+		if p.ID != 0 {
+			stored, _ := pg.ProfileByID(p.ID)
+			if stored != nil && sameLLMEndpoint(p.Format, p.BaseURL, stored.Format, stored.BaseURL) {
+				if validate.APIKey == "" {
+					validate.APIKey = stored.APIKey
+				}
+				if validate.CustomHeaders == "" && !p.ClearCustomHeaders {
+					validate.CustomHeaders = stored.CustomHeaders
+				}
+			}
+		}
+		if _, err := validate.NewProvider(); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2172,7 +2349,7 @@ func (s *Server) restoreTasksAfterProfileDelete(pg *db.DB) {
 				// paused task remains paused and terminal tasks remain immutable.
 				if !isTerminalStatus(task.lifecycleSnapshot().Status) && s.taskRuntimeAvailable(task, "planner", "worker") {
 					if _, reopenErr := task.Store.ReopenIntentsByBlockedReason(db.IntentBlockedLLMQuota); reopenErr != nil {
-						log.Printf("[llm-profile] task %s reopen quota-blocked intents after profile delete: %v", task.ID, reopenErr)
+						slog.Warn("[llm-profile] reopen quota-blocked intents failed after profile delete", "task_id", task.ID, "err", reopenErr)
 					}
 				}
 				task.Notify()
@@ -2236,6 +2413,269 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.llmPoolStatus())
 }
 
+const maxModelRedirects = 5
+
+// LLMPrivateEndpointsEnv is an opt-in comma-separated allow-list of exact
+// host:port entries (for example "127.0.0.1:11434,host.docker.internal:11434")
+// that POST /api/llm/models may contact on loopback or private addresses.
+// Unset or empty enforces the strict public-only policy.
+const LLMPrivateEndpointsEnv = "ARTEX_LLM_PRIVATE_ENDPOINTS"
+
+type modelURLRefusalError struct {
+	msg string
+}
+
+func (e *modelURLRefusalError) Error() string { return e.msg }
+
+func normalizeModelHost(host string) (kind, normalized string, ok bool) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", "", false
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return intercept.TargetIP, addr.Unmap().WithZone("").String(), true
+	}
+	t, ok := intercept.NormalizeTarget(host)
+	if !ok || t.Kind == intercept.TargetCIDR || t.Host == "" {
+		return "", "", false
+	}
+	return t.Kind, t.Host, true
+}
+
+func urlEffectivePort(u *url.URL) (int, bool) {
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return 0, false
+		}
+		return n, true
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return 80, true
+	case "https":
+		return 443, true
+	default:
+		return 0, false
+	}
+}
+
+func parsePrivateModelEndpoints(raw string) map[string]bool {
+	out := map[string]bool{}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		host, portStr, err := net.SplitHostPort(entry)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			continue
+		}
+		_, normHost, ok := normalizeModelHost(host)
+		if !ok {
+			continue
+		}
+		out[net.JoinHostPort(normHost, strconv.Itoa(port))] = true
+	}
+	return out
+}
+
+func sameRedirectHost(a, b *url.URL) bool {
+	ha := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(a.Hostname())), ".")
+	hb := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(b.Hostname())), ".")
+	return ha != "" && ha == hb
+}
+
+// Ranges that are not public Internet addresses and that
+// intercept.IsNonPublicAddr does not cover. The shared ones are in use on
+// private networks (overlay networks, fake-IP resolvers), so an allow-listed
+// endpoint may sit there; the reserved ones are never a model endpoint.
+var (
+	modelSharedPrefixes = []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"), // carrier-grade NAT (RFC 6598)
+		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking (RFC 2544)
+	}
+	modelReservedPrefixes = []netip.Prefix{
+		netip.MustParsePrefix("192.0.0.0/24"), // IETF protocol assignments (RFC 6890)
+		netip.MustParsePrefix("240.0.0.0/4"),  // reserved, and the limited broadcast address
+	}
+	// IPv6 prefixes whose addresses reach the IPv4 host they embed. A DNS64
+	// resolver answers with NAT64 addresses for every IPv4-only name, so the
+	// prefixes are not blocked as a whole: the embedded address is judged.
+	modelNAT64Prefix = netip.MustParsePrefix("64:ff9b::/96") // the low 32 bits name an IPv4 host
+	model6to4Prefix  = netip.MustParsePrefix("2002::/16")    // bits 16 to 47 name an IPv4 host
+)
+
+// modelEmbeddedIPv4 returns the IPv4 address a NAT64 or 6to4 address embeds.
+func modelEmbeddedIPv4(addr netip.Addr) (netip.Addr, bool) {
+	b := addr.As16()
+	switch {
+	case modelNAT64Prefix.Contains(addr):
+		return netip.AddrFrom4([4]byte(b[12:16])), true
+	case model6to4Prefix.Contains(addr):
+		return netip.AddrFrom4([4]byte(b[2:6])), true
+	}
+	return netip.Addr{}, false
+}
+
+func prefixesContain(prefixes []netip.Prefix, addr netip.Addr) bool {
+	for _, p := range prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) isBlockedModelAddr(addr netip.Addr, allowPrivate bool) bool {
+	if !addr.IsValid() {
+		return true
+	}
+	addr = addr.Unmap().WithZone("")
+	if v4, ok := modelEmbeddedIPv4(addr); ok {
+		addr = v4
+	}
+	if s != nil && s.allowLoopbackModels && addr.IsLoopback() {
+		return false
+	}
+	shared := prefixesContain(modelSharedPrefixes, addr)
+	if !intercept.IsNonPublicAddr(addr) && !shared && !prefixesContain(modelReservedPrefixes, addr) {
+		return false
+	}
+	if allowPrivate {
+		// Allow-listed self-hosted endpoints may resolve to loopback, RFC1918 /
+		// unique-local private addresses, or the shared ranges above, but never
+		// link-local, unspecified, multicast, reserved, or instance-metadata
+		// addresses (such as 169.254.169.254, 100.100.100.200 or fd00:ec2::254).
+		if addr.IsLoopback() {
+			return false
+		}
+		if (addr.IsPrivate() || shared) && intercept.ValidateExemptionHost(addr.String()) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) lookupModelIPs(ctx context.Context, host string) ([]netip.Addr, error) {
+	if s != nil && s.modelLookupIP != nil {
+		return s.modelLookupIP(ctx, host)
+	}
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+type modelURLGuard struct {
+	s                *Server
+	privateEndpoints map[string]bool
+	mu               sync.Mutex
+	allowedDialAddrs map[string]bool
+}
+
+func newModelURLGuard(s *Server) *modelURLGuard {
+	return &modelURLGuard{
+		s:                s,
+		privateEndpoints: parsePrivateModelEndpoints(os.Getenv(LLMPrivateEndpointsEnv)),
+	}
+}
+
+func (g *modelURLGuard) allowDialAddr(addr netip.Addr, port int) {
+	if !addr.IsValid() || port < 1 || port > 65535 {
+		return
+	}
+	key := net.JoinHostPort(addr.Unmap().WithZone("").String(), strconv.Itoa(port))
+	g.mu.Lock()
+	if g.allowedDialAddrs == nil {
+		g.allowedDialAddrs = map[string]bool{}
+	}
+	g.allowedDialAddrs[key] = true
+	g.mu.Unlock()
+}
+
+func (g *modelURLGuard) isAllowedDialAddr(addr netip.Addr, port string) bool {
+	key := net.JoinHostPort(addr.Unmap().WithZone("").String(), port)
+	g.mu.Lock()
+	ok := g.allowedDialAddrs[key]
+	g.mu.Unlock()
+	return ok
+}
+
+func (g *modelURLGuard) blockDial(_, address string, _ syscall.RawConn) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return &modelURLRefusalError{msg: "target address is not allowed"}
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return &modelURLRefusalError{msg: "target address is not allowed"}
+	}
+	allowPrivate := g.isAllowedDialAddr(addr, port)
+	if g.s.isBlockedModelAddr(addr, allowPrivate) {
+		return &modelURLRefusalError{msg: "target address is not allowed"}
+	}
+	return nil
+}
+
+// validateURL validates a base_url candidate, proxy URL, or redirect target for
+// POST /api/llm/models. Only http and https URLs are permitted; hosts must
+// resolve strictly to public addresses unless their exact host:port is listed
+// in ARTEX_LLM_PRIVATE_ENDPOINTS. Errors never include resolved IP addresses.
+func (g *modelURLGuard) validateURL(ctx context.Context, rawURL, role string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil, &modelURLRefusalError{msg: fmt.Sprintf("invalid %s URL", role)}
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL must use http or https", role)}
+	}
+	if u.Opaque != "" {
+		return nil, &modelURLRefusalError{msg: fmt.Sprintf("invalid %s URL", role)}
+	}
+	port, ok := urlEffectivePort(u)
+	if !ok {
+		return nil, &modelURLRefusalError{msg: fmt.Sprintf("invalid %s URL", role)}
+	}
+	kind, normHost, ok := normalizeModelHost(u.Hostname())
+	if !ok {
+		return nil, &modelURLRefusalError{msg: fmt.Sprintf("invalid %s URL host", role)}
+	}
+	hostPort := net.JoinHostPort(normHost, strconv.Itoa(port))
+	allowPrivate := g.privateEndpoints[hostPort]
+
+	if kind == intercept.TargetIP {
+		addr, err := netip.ParseAddr(normHost)
+		if err != nil || g.s.isBlockedModelAddr(addr, allowPrivate) {
+			return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
+		}
+		if allowPrivate {
+			g.allowDialAddr(addr, port)
+		}
+		return u, nil
+	}
+	if !allowPrivate && !(g.s != nil && g.s.allowLoopbackModels) && (normHost == "localhost" || strings.HasSuffix(normHost, ".localhost")) {
+		return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
+	}
+	addrs, err := g.s.lookupModelIPs(ctx, normHost)
+	if err != nil || len(addrs) == 0 {
+		return nil, &modelURLRefusalError{msg: fmt.Sprintf("failed to resolve %s host", role)}
+	}
+	for _, addr := range addrs {
+		if g.s.isBlockedModelAddr(addr, allowPrivate) {
+			return nil, &modelURLRefusalError{msg: fmt.Sprintf("%s URL host is not allowed", role)}
+		}
+	}
+	if allowPrivate {
+		for _, addr := range addrs {
+			g.allowDialAddr(addr, port)
+		}
+	}
+	return u, nil
+}
+
 // pgListModels fetches available models from the provider's API endpoint.
 // Supports OpenAI-format (GET /models), Anthropic-format (GET /v1/models) and
 // Ollama (keyless OpenAI-compatible GET /v1/models on the local server); for
@@ -2251,6 +2691,10 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Provider) == "bedrock-gateway" {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": "enter the Bedrock model ID manually; this gateway has no model-list endpoint"})
 		return
 	}
 	// Resolve API key: form input > profile stored key. The stored key is only
@@ -2285,7 +2729,9 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	rawBaseURL := strings.TrimSpace(req.BaseURL)
+	baseURL := strings.TrimRight(rawBaseURL, "/")
+	defaultOllama := provider == "ollama" && rawBaseURL == ""
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose
@@ -2349,19 +2795,98 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build HTTP client with optional proxy.
-	transport := &http.Transport{}
+	// Validate proxy and every candidate URL before sending any request.
+	// Pre-request validation is required in addition to the dial-time guard
+	// because a caller-supplied HTTP proxy fetches the target URL itself.
+	guard := newModelURLGuard(s)
+	var proxyURL *url.URL
 	if p := strings.TrimSpace(req.Proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
-			transport.Proxy = http.ProxyURL(pu)
+		var err error
+		proxyURL, err = guard.validateURL(r.Context(), p, "proxy")
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
 		}
 	}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	if defaultOllama {
+		// The built-in Ollama default is code-owned, not caller input: allow
+		// dialing its exact host:port without relaxing caller-supplied URLs.
+		if du, err := url.Parse(agent.DefaultOllamaBaseURL); err == nil {
+			if addr, err := netip.ParseAddr(du.Hostname()); err == nil {
+				if port, ok := urlEffectivePort(du); ok {
+					guard.allowDialAddr(addr, port)
+				}
+			}
+		}
+	} else {
+		for _, c := range candidates {
+			if _, err := guard.validateURL(r.Context(), c.url, "endpoint"); err != nil {
+				writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+		}
+	}
+
+	// Build HTTP client with strict dial guard, redirect validation, and optional proxy.
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	transport.Proxy = nil
+	if proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	if s.modelRootCAs != nil {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		} else {
+			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		}
+		transport.TLSClientConfig.RootCAs = s.modelRootCAs
+	}
+	dialCtx := (&net.Dialer{Timeout: 10 * time.Second, Control: guard.blockDial}).DialContext
+	if s.modelDialContext != nil {
+		dialCtx = s.modelDialContext
+	}
+	transport.DialContext = dialCtx
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxModelRedirects {
+				return &modelURLRefusalError{msg: "too many redirects"}
+			}
+			if len(via) > 0 {
+				prev := via[len(via)-1].URL
+				prevScheme := strings.ToLower(prev.Scheme)
+				nextScheme := strings.ToLower(req.URL.Scheme)
+				if nextScheme != prevScheme {
+					if !(prevScheme == "http" && nextScheme == "https" && sameRedirectHost(prev, req.URL)) {
+						return &modelURLRefusalError{msg: "redirect scheme change is not allowed"}
+					}
+				}
+			}
+			if _, err := guard.validateURL(req.Context(), req.URL.String(), "redirect"); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
 
 	// Try each candidate; return the first that yields a non-empty model list.
 	var lastErr string
 	emptyOK := false
-	for _, c := range candidates {
+	for i, c := range candidates {
+		if i > 0 && !defaultOllama {
+			if _, err := guard.validateURL(r.Context(), c.url, "endpoint"); err != nil {
+				writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+		}
 		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, c.url, nil)
 		if err != nil {
 			lastErr = "failed to build request: " + err.Error()
@@ -2370,13 +2895,20 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		httpReq.Header = c.hdr
 		resp, err := client.Do(httpReq)
 		if err != nil {
+			var refusal *modelURLRefusalError
+			if errors.As(err, &refusal) {
+				writeJSON(w, 200, map[string]any{"ok": false, "error": refusal.Error()})
+				return
+			}
 			lastErr = "request failed: " + err.Error()
 			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
+			// The status only: echoing the body would let the caller read what
+			// any host this endpoint can reach answers.
+			lastErr = fmt.Sprintf("API returned %d %s (the response body is not shown)", resp.StatusCode, http.StatusText(resp.StatusCode))
 			continue
 		}
 		// Both OpenAI and Anthropic return {"data": [{"id": "..."},...]}.

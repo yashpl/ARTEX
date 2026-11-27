@@ -6,15 +6,9 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { httpStatusTone } from "@/lib/status";
 import { cn, copyText } from "@/lib/utils";
-
-export function statusTone(status: number) {
-  if (status >= 500) return "text-red-500";
-  if (status >= 400) return "text-amber-500";
-  if (status >= 300) return "text-blue-500";
-  if (status >= 200) return "text-emerald-500";
-  return "text-muted-foreground";
-}
+import { t } from "@/i18n";
 
 function StartLine({ line }: { line: string }) {
   const response = /^(HTTP\/\S+)(\s+)(\d{3})(.*)$/.exec(line);
@@ -23,7 +17,7 @@ function StartLine({ line }: { line: string }) {
       <>
         <span className="text-muted-foreground">{response[1]}</span>
         {response[2]}
-        <span className={statusTone(Number(response[3]))}>{response[3]}</span>
+        <span className={httpStatusTone(Number(response[3]))}>{response[3]}</span>
         {response[4]}
       </>
     );
@@ -114,7 +108,7 @@ function HighlightedBody({ body, format }: { body: string; format: BodyFormat })
 export function HttpCodeBlock({ raw }: { raw: string }) {
   const [wrapLines, setWrapLines] = React.useState(true);
   const [copied, setCopied] = React.useState(false);
-  const value = raw || "(empty)";
+  const value = raw || t("(empty)");
   const lines = value.replaceAll("\r\n", "\n").split("\n");
   const separator = lines.indexOf("");
   const body = separator >= 0 ? lines.slice(separator + 1).join("\n") : "";
@@ -132,7 +126,7 @@ export function HttpCodeBlock({ raw }: { raw: string }) {
       setCopied(true);
       return;
     }
-    toast.error("Copy failed; use Ctrl/Cmd+A then copy");
+    toast.error(t("Copy failed; use Ctrl/Cmd+A then copy"));
   };
 
   const renderLine = (line: string, index: number) => {
@@ -151,14 +145,14 @@ export function HttpCodeBlock({ raw }: { raw: string }) {
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label={wrapLines ? "Disable word wrap" : "Enable word wrap"}
+              aria-label={wrapLines ? t("Disable word wrap") : t("Enable word wrap")}
               aria-pressed={wrapLines}
               onClick={() => setWrapLines((current) => !current)}
             >
               <WrapTextIcon />
             </Button>
           </TooltipTrigger>
-          <TooltipContent side="bottom">{wrapLines ? "Disable word wrap" : "Enable word wrap"}</TooltipContent>
+          <TooltipContent side="bottom">{wrapLines ? t("Disable word wrap") : t("Enable word wrap")}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -166,19 +160,19 @@ export function HttpCodeBlock({ raw }: { raw: string }) {
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label={copied ? "Message copied" : "Copy message"}
+              aria-label={copied ? t("Message copied") : t("Copy message")}
               onClick={() => void copyPacket()}
             >
               {copied ? <CheckIcon /> : <CopyIcon />}
             </Button>
           </TooltipTrigger>
-          <TooltipContent side="bottom">{copied ? "Copied" : "Copy message"}</TooltipContent>
+          <TooltipContent side="bottom">{copied ? t("Copied") : t("Copy message")}</TooltipContent>
         </Tooltip>
       </div>
       {/* biome-ignore lint/a11y/useSemanticElements: textarea cannot preserve line numbers and syntax-highlighting markup. */}
       <div
         role="textbox"
-        aria-label="HTTP message code"
+        aria-label={t("HTTP message code")}
         aria-multiline="true"
         aria-readonly="true"
         tabIndex={0}

@@ -1,3 +1,4 @@
+import { t } from "@/i18n";
 import type { CompanyScopeKind, CompanyScopeRule } from "@/lib/types";
 
 export const MAX_COMPANY_SCOPE_VALUE_LENGTH = 1024;
@@ -83,12 +84,16 @@ function domainHostname(value: string): string | null {
     if (value.startsWith("//")) candidate = `http:${value}`;
     else if (!value.includes("://")) candidate = `http://${value}`;
     const url = new URL(candidate);
-    return (
-      url.hostname
-        .replace(/^\[|\]$/g, "")
-        .replace(/\.$/, "")
-        .toLowerCase() || null
-    );
+    const hostname = url.hostname
+      .replace(/^\[|\]$/g, "")
+      .replace(/\.$/, "")
+      .toLowerCase();
+    // "*.example.com" scopes a domain and its subdomains; the server accepts it on a registrable domain.
+    if (hostname.startsWith("*.")) {
+      const domain = hostname.slice(2);
+      return ipVersion(domain) === null ? domain : null;
+    }
+    return hostname || null;
   } catch {
     return null;
   }
@@ -96,14 +101,14 @@ function domainHostname(value: string): string | null {
 
 export function companyScopeRuleError(rule: CompanyScopeRule): string {
   const value = rule.value.trim();
-  if (!value) return "Please enter a scope value";
+  if (!value) return t("Please enter a scope value");
   if (Array.from(value).length > MAX_COMPANY_SCOPE_VALUE_LENGTH) {
-    return `At most ${MAX_COMPANY_SCOPE_VALUE_LENGTH} characters`;
+    return t("At most {count} characters", { count: MAX_COMPANY_SCOPE_VALUE_LENGTH });
   }
   if (rule.kind === "domain") {
-    if (/\s/.test(value)) return "Enter a valid domain or URL without spaces";
+    if (/\s/.test(value)) return t("Enter a valid domain or URL without spaces");
     const hostname = domainHostname(value);
-    if (!hostname || ipVersion(hostname) !== null) return "Enter a valid domain or URL";
+    if (!hostname || ipVersion(hostname) !== null) return t("Enter a valid domain or URL");
     const labels = hostname.split(".");
     if (
       hostname.length > 253 ||
@@ -113,20 +118,20 @@ export function companyScopeRuleError(rule: CompanyScopeRule): string {
           !label || label.length > 63 || label.startsWith("-") || label.endsWith("-") || !/^[a-z0-9-]+$/i.test(label),
       )
     ) {
-      return "Enter a valid domain or URL";
+      return t("Enter a valid domain or URL");
     }
   }
-  if (rule.kind === "ip" && ipVersion(value) === null) return "Enter a valid IP";
+  if (rule.kind === "ip" && ipVersion(value) === null) return t("Enter a valid IP");
   if (rule.kind === "cidr") {
     const separator = value.lastIndexOf("/");
-    if (separator <= 0) return "Enter a valid CIDR network";
+    if (separator <= 0) return t("Enter a valid CIDR network");
     const address = value.slice(0, separator);
     const prefixText = value.slice(separator + 1);
     const version = ipVersion(address);
-    if (version === null || !/^\d+$/.test(prefixText)) return "Enter a valid CIDR network";
+    if (version === null || !/^\d+$/.test(prefixText)) return t("Enter a valid CIDR network");
     const prefix = Number(prefixText);
-    if (version === 4 && (prefix < 16 || prefix > 32)) return "IPv4 prefix must be between /16 and /32";
-    if (version === 6 && (prefix < 32 || prefix > 128)) return "IPv6 prefix must be between /32 and /128";
+    if (version === 4 && (prefix < 16 || prefix > 32)) return t("IPv4 prefix must be between /16 and /32");
+    if (version === 6 && (prefix < 32 || prefix > 128)) return t("IPv6 prefix must be between /32 and /128");
   }
   return "";
 }
@@ -138,7 +143,7 @@ export function classifyCompanyScopeLine(
 ): CompanyScopeTextIssue {
   const value = raw.trim();
   if (Array.from(value).length > MAX_COMPANY_SCOPE_VALUE_LENGTH) {
-    return { line, error: `At most ${MAX_COMPANY_SCOPE_VALUE_LENGTH} characters` };
+    return { line, error: t("At most {count} characters", { count: MAX_COMPANY_SCOPE_VALUE_LENGTH }) };
   }
   if (preservedRule) {
     const rule = { kind: preservedRule.kind, value };
@@ -156,7 +161,7 @@ export function classifyCompanyScopeLine(
     return error ? { line, error } : { line, rule };
   }
   if (ipVersion(value) !== null) return { line, rule: { kind: "ip", value } };
-  if (looksLikeIPAddress(value)) return { line, error: "Enter a valid IP" };
+  if (looksLikeIPAddress(value)) return { line, error: t("Enter a valid IP") };
 
   const looksLikeDomain = value.includes("://") || (!/\s/.test(value) && value.includes("."));
   if (looksLikeDomain) {

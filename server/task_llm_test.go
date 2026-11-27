@@ -654,9 +654,9 @@ func TestTaskLLMStreamStopsWhenChainExhausted(t *testing.T) {
 func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 
 	profileID, err := m.pg.SaveProfile(&db.LLMProfile{
 		Name:   fmt.Sprintf("delete-quota-fallback-%d", time.Now().UnixNano()),

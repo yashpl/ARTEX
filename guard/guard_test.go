@@ -2,6 +2,7 @@ package guard
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -38,6 +39,34 @@ func TestPreToolUsePassthrough(t *testing.T) {
 	// audit still records every gated call
 	if len(g.Audit()) == 0 {
 		t.Error("audit should record gated calls")
+	}
+}
+
+// A deny must not leave a prior allow row in the audit ring.
+func TestPreToolUseAuditIsFinalDecision(t *testing.T) {
+	ic := intercept.New(nil)
+	ic.SetRulesForTest([]db.InterceptRule{{
+		ID: 1, Name: "deny nmap", Enabled: true, Priority: 10,
+		MatchTarget: "tool_input", MatchType: "string", Action: "deny",
+		Pattern: "nmap", Message: "no nmap",
+	}})
+	g := NewWithInterceptor(ic)
+	input, _ := json.Marshal(map[string]string{"command": "nmap -sV x"})
+	block, _, _ := g.Hooks().PreToolUse(context.Background(), "Bash", input)
+	if !block {
+		t.Fatal("expected block")
+	}
+	audit := g.Audit()
+	if len(audit) != 1 || audit[0].Action != "block" || audit[0].Tool != "Bash" {
+		t.Fatalf("audit=%+v, want a single block", audit)
+	}
+	if audit[0].Command != "nmap -sV x" {
+		t.Fatalf("block command=%q, want the denied command", audit[0].Command)
+	}
+	for _, e := range audit {
+		if e.Action == "allow" {
+			t.Fatalf("blocked call still has an allow row: %+v", audit)
+		}
 	}
 }
 
@@ -209,6 +238,45 @@ func TestShortBlockReasonUnchanged(t *testing.T) {
 	if got, want := TargetBlockMessage(res),
 		"[ARTEX platform control, not target defense] TARGET_DENIED: target app.example.com:443: the request was denied. "+targetGuidance[intercept.TargetDenied]; got != want {
 		t.Errorf("TargetBlockMessage = %q, want %q", got, want)
+	}
+}
+
+// A rule store that cannot be read blocks the call end to end, in the full guard
+// (workers, chat) and in the target-only guard (planner, main agent), instead of
+// letting it run unchecked. The handle is closed before its first query, so no
+// server is contacted.
+func TestUnreadableRuleStoreBlocksCalls(t *testing.T) {
+	closed := func() *intercept.Interceptor {
+		sqlDB, err := sql.Open("pgx", "postgres://u:p@127.0.0.1:1/unreachable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sqlDB.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return intercept.New(&db.DB{DB: sqlDB})
+	}
+	for name, g := range map[string]*Guard{
+		"full guard":        NewWithInterceptor(closed()),
+		"target-only guard": NewTargetOnly(closed()),
+	} {
+		for _, call := range []struct{ tool, input string }{
+			{"Bash", `{"command":"ls -la"}`},
+			{"Monitor", `{"command":"tail -f /dev/null"}`},
+			{"create_mcp", `{"name":"x","command":"sh"}`},
+		} {
+			block, msg := pre(g, context.Background(), call.tool, call.input)
+			if !block || !strings.HasPrefix(msg, "[ARTEX platform control, not target defense]") ||
+				!strings.Contains(msg, "intercept rules could not be loaded") {
+				t.Errorf("%s: %s block=%v msg=%q, want a block that names the unreadable rule store", name, call.tool, block, msg)
+			}
+		}
+	}
+	// The blocked call is recorded as a block, never as an allow.
+	g := NewWithInterceptor(closed())
+	pre(g, context.Background(), "Bash", `{"command":"ls -la"}`)
+	if a := g.Audit(); len(a) != 1 || a[0].Action != "block" {
+		t.Errorf("audit = %+v, want one block entry", a)
 	}
 }
 

@@ -11,9 +11,9 @@ import (
 func TestTaskLLMSpendCountsJudgeNotChat(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	taskID := fmt.Sprintf("spend-%d", time.Now().UnixNano())
 	t.Cleanup(func() {

@@ -1,11 +1,15 @@
 package mcphttp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -103,5 +107,175 @@ func TestLegacySSEClientDiscoverAndCall(t *testing.T) {
 	got, err := c.Call(ctx, "echo", map[string]any{"value": "x"})
 	if err != nil || got != "ok" {
 		t.Fatalf("Call() = %q, %v", got, err)
+	}
+}
+
+func TestReadLimitedLine(t *testing.T) {
+	short := bufio.NewReaderSize(strings.NewReader("hello\nnext\n"), 4)
+	got, err := readLimitedLine(short, 16)
+	if err != nil || got != "hello\n" {
+		t.Fatalf("short = %q, %v", got, err)
+	}
+	got, err = readLimitedLine(short, 16)
+	if err != nil || got != "next\n" {
+		t.Fatalf("second = %q, %v", got, err)
+	}
+
+	exact := strings.Repeat("a", 7) + "\n"
+	got, err = readLimitedLine(bufio.NewReaderSize(strings.NewReader(exact), 3), 8)
+	if err != nil || got != exact {
+		t.Fatalf("exact = %q, %v", got, err)
+	}
+
+	over := strings.Repeat("b", 8) + "\n"
+	if _, err = readLimitedLine(bufio.NewReaderSize(strings.NewReader(over), 3), 8); err == nil || !strings.Contains(err.Error(), "exceeds 8 bytes") {
+		t.Fatalf("over: %v", err)
+	}
+
+	got, err = readLimitedLine(bufio.NewReader(strings.NewReader("tail")), 16)
+	if got != "tail" || !errors.Is(err, io.EOF) {
+		t.Fatalf("eof = %q, %v", got, err)
+	}
+}
+
+func TestReadSSEEndpointRejectsLongLine(t *testing.T) {
+	base, err := url.Parse("https://mcp.example.com/sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := "data: " + strings.Repeat("a", mcpMaxRPCBytes) + "\n"
+	if _, err = readSSEEndpoint(bufio.NewReader(strings.NewReader(line)), base); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("long line: %v", err)
+	}
+}
+
+func TestReadSSEEndpointSameOrigin(t *testing.T) {
+	base, err := url.Parse("https://mcp.example.com:8443/sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(line string) (string, error) {
+		stream := "event: endpoint\ndata: " + line + "\n\n"
+		return readSSEEndpoint(bufio.NewReader(strings.NewReader(stream)), base)
+	}
+	for _, line := range []string{
+		"/message?sessionId=1",
+		"https://mcp.example.com:8443/message",
+		"HTTPS://MCP.EXAMPLE.COM:8443/message",
+		"//mcp.example.com:8443/message",
+	} {
+		got, err := read(line)
+		if err != nil {
+			t.Errorf("%q: %v", line, err)
+			continue
+		}
+		u, err := url.Parse(got)
+		if err != nil || !sameOrigin(base, u) {
+			t.Errorf("%q: resolved to %q, not the configured origin", line, got)
+		}
+	}
+	for _, line := range []string{
+		"https://evil.example/message",
+		"http://mcp.example.com:8443/message",
+		"https://mcp.example.com:444/message",
+		"//evil.example/message",
+		"http://user:pass@mcp.example.com:8443/message",
+		"ftp://mcp.example.com/message",
+	} {
+		if got, err := read(line); err == nil {
+			t.Errorf("%q: accepted as %q, want a refusal", line, got)
+		}
+	}
+}
+
+func TestReadSSEEndpointDefaultPort(t *testing.T) {
+	base, err := url.Parse("https://mcp.example.com/sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := "data: https://mcp.example.com:443/message\n\n"
+	if _, err := readSSEEndpoint(bufio.NewReader(strings.NewReader(stream)), base); err != nil {
+		t.Fatalf("explicit default port refused: %v", err)
+	}
+}
+
+func TestParseMCPURL(t *testing.T) {
+	for _, raw := range []string{"ftp://x/y", "not-a-url", "http:///nohost", ""} {
+		if _, err := parseMCPURL(raw); err == nil {
+			t.Errorf("%q accepted, want a refusal", raw)
+		}
+	}
+	for _, raw := range []string{"http://x/y", "https://x:8443/y"} {
+		if _, err := parseMCPURL(raw); err != nil {
+			t.Errorf("%q refused: %v", raw, err)
+		}
+	}
+}
+
+func TestLegacySSERefusesCrossOriginEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: endpoint\ndata: http://evil.invalid/message\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := NewSSE(ctx, "test", srv.URL+"/sse", nil, false); err == nil {
+		t.Fatal("cross-origin SSE endpoint accepted")
+	}
+}
+
+func TestMCPClientRefusesCrossOriginRedirect(t *testing.T) {
+	var hits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+	}))
+	defer target.Close()
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/steal", http.StatusFound)
+	}))
+	defer src.Close()
+
+	base, err := url.Parse(src.URL + "/sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := &http.Client{CheckRedirect: redirectPolicy(base)}
+	resp, err := hc.Get(src.URL + "/sse")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("cross-origin redirect accepted")
+	}
+	if hits != 0 {
+		t.Fatalf("redirect target was reached %d times", hits)
+	}
+}
+
+func TestMCPClientAllowsSameOriginRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/sse2", http.StatusFound)
+	})
+	mux.HandleFunc("/sse2", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, err := url.Parse(srv.URL + "/sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := &http.Client{CheckRedirect: redirectPolicy(base)}
+	resp, err := hc.Get(srv.URL + "/sse")
+	if err != nil {
+		t.Fatalf("same-origin redirect refused: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
 	}
 }

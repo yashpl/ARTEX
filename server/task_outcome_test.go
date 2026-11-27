@@ -14,7 +14,7 @@ import (
 func TestTaskOutcomeCard(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	task, err := m.CreateTask("outcome card", "goal", nil, 0, 0)
@@ -22,7 +22,10 @@ func TestTaskOutcomeCard(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer func() { _ = m.pg.DeleteTask(taskID) }()
+	defer func() {
+		_, _ = m.pg.DeleteFindingsByTask(taskID)
+		_ = m.pg.DeleteTask(taskID)
+	}()
 	// skill_usage has no foreign keys, so DeleteTask leaves these rows behind,
 	// and their misses would outrank TestSkillGapsReport's fixture in later runs.
 	defer func() { _, _ = m.pg.Exec(`DELETE FROM skill_usage WHERE task_id=$1`, taskID) }()

@@ -14,7 +14,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"iter"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -91,6 +93,8 @@ type Config struct {
 	// LLM request built from this config. Empty = don't set it, leaving the Go/Norma
 	// default UA untouched (the historical behavior). Validated by ValidateUserAgent.
 	UserAgent string
+	// CustomHeaders are static Bedrock gateway headers, one Name: Value per line.
+	CustomHeaders string
 	// Retry holds the retry parameters resolved for this config (profile override →
 	// global policy → built-in default, resolved server-side). See RetryConfig for
 	// the per-layer semantics; zero values = fully inherit the built-in defaults.
@@ -140,6 +144,7 @@ const (
 // forcing our base-URL/key defaults so an empty key never falls back to
 // OpenAI's public endpoint).
 const FormatOllama llm.Format = "ollama"
+const FormatBedrockGateway llm.Format = "bedrock-gateway"
 
 // DefaultOllamaBaseURL is the base of Ollama's OpenAI-compatible endpoint the
 // provider appends /chat/completions to. Must never end up empty: with an
@@ -272,6 +277,13 @@ func FromEnv() (Config, bool) {
 		if c.Model == "" {
 			c.Model = "llama3.2"
 		}
+	case "bedrock-gateway":
+		c.Format = FormatBedrockGateway
+		c.APIKey = strings.TrimSpace(os.Getenv("ARTEX_LLM_API_KEY"))
+		c.CustomHeaders = os.Getenv("ARTEX_LLM_CUSTOM_HEADERS")
+		if c.BaseURL == "" || c.Model == "" {
+			return Config{}, false
+		}
 	default:
 		c.Format = llm.FormatAnthropic
 		c.APIKey = anthKey
@@ -323,6 +335,10 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		if c.Model == "" {
 			c.Model = "llama3.2"
 		}
+	case "bedrock-gateway":
+		c.Format = FormatBedrockGateway
+		// No public-provider defaults: an absent URL, model or token fails closed.
+		c.BaseURL = strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(c.BaseURL, "/invoke-with-response-stream"), "/invoke"), "/")
 	default:
 		c.Format = llm.FormatAnthropic
 		// provider appends "/v1/messages".
@@ -354,6 +370,8 @@ func (c Config) Provider() string {
 		return "openai-responses"
 	case FormatOllama:
 		return "ollama"
+	case FormatBedrockGateway:
+		return "bedrock-gateway"
 	}
 	return "anthropic"
 }
@@ -382,6 +400,17 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		if strings.TrimSpace(apiKey) == "" {
 			apiKey = ollamaPlaceholderKey
 		}
+	}
+	if wireFormat == FormatBedrockGateway {
+		headers, err := validateBedrockGateway(baseURL, apiKey, c.Model, c.CustomHeaders)
+		if err != nil {
+			return nil, err
+		}
+		wireFormat = llm.FormatAnthropic
+		qt := client.Transport.(quotaAwareTransport)
+		qt.base = &bedrockGatewayTransport{base: qt.base, baseURL: baseURL, token: apiKey, model: c.Model, headers: headers}
+		client.Transport = qt
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}
 	lc := llm.Config{
 		Format:     wireFormat,
@@ -586,14 +615,25 @@ func ValidateUserAgent(raw string) (string, error) {
 // SSE stream from flooding the log.
 func logTestConnection(c Config, capt *llmrec.Capture) {
 	attempts := capt.Attempts()
+	if c.Format == FormatBedrockGateway {
+		if len(attempts) == 0 {
+			slog.Warn("[llm-test] bedrock-gateway: no HTTP request was sent")
+			return
+		}
+		for i, a := range attempts {
+			slog.Info("[llm-test] bedrock-gateway attempt", "attempt", i+1, "attempts", len(attempts), "status", a.Status)
+		}
+		return
+	}
 	if len(attempts) == 0 {
-		log.Printf("[llm-test] %s / %s @ %s — no HTTP request was ever sent (config resolution or connection setup failed)",
-			c.Provider(), c.Model, c.BaseURL)
+		slog.Warn("[llm-test] no HTTP request was ever sent (config resolution or connection setup failed)",
+			"provider", c.Provider(), "model", c.Model, "base_url", c.BaseURL)
 		return
 	}
 	for i, a := range attempts {
-		log.Printf("[llm-test] %s / %s @ %s — attempt %d/%d HTTP %d\nresponse body: %s",
-			c.Provider(), c.Model, c.BaseURL, i+1, len(attempts), a.Status, clipBody(a.Body))
+		slog.Info("[llm-test] connection attempt",
+			"provider", c.Provider(), "model", c.Model, "base_url", c.BaseURL,
+			"attempt", i+1, "attempts", len(attempts), "status", a.Status, "response_body", clipBody(a.Body))
 	}
 }
 
@@ -601,6 +641,11 @@ func logTestConnection(c Config, capt *llmrec.Capture) {
 // the head of an SSE stream while bounding a runaway response.
 func clipBody(s string) string {
 	s = strings.TrimSpace(s)
+	// One log record per attempt. A body that contains a newline would
+	// otherwise look like a second log line.
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
 	if s == "" {
 		return "(empty)"
 	}
@@ -645,17 +690,35 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	// budget to emit OK cleanly (finish=stop).
 	// EscalateMaxTokens stays false: don't raise the cap and retry on truncation, to
 	// avoid burning tokens in a resume loop.
+	probe := &connTestProvider{inner: prov}
 	reply, err := agentcore.Run(ctx, agentcore.Options{
-		Provider:       prov,
+		Provider:       probe,
 		SystemPrompt:   []string{"You are a connection test. Just output the two characters OK — no thinking, no explanation, nothing else."},
+		Tools:          []actool.CoreTool{}, // not nil: nil means the SDK's unconfined file and shell tools
 		PermissionMode: acperm.ModeBypass,
 		MaxTurns:       1,
 		MaxTokens:      8192,
 		NonStreaming:   !c.Stream, // use this profile's real send/receive mode for the connection test
+		// Without this the SDK still adds TaskOutput/TaskStop/TaskList/Monitor, and
+		// some models answer the test with a call to one of them instead of OK.
+		DisableBackgroundTasks: true,
 	}, "ping")
 	lat := time.Since(start)
 	if err != nil {
+		if c.Format == FormatBedrockGateway {
+			attempts := capt.Attempts()
+			if len(attempts) > 0 && attempts[len(attempts)-1].Status >= 400 {
+				return lat, "", fmt.Errorf("Bedrock gateway returned HTTP %d", attempts[len(attempts)-1].Status)
+			}
+			return lat, "", fmt.Errorf("Bedrock gateway connection failed")
+		}
 		return lat, "", err
+	}
+	// Reject tool-call replies (#526): the connection test asks for plain text
+	// with no tools; a model answering with a tool call or tool_calls/tool_use
+	// finish reason must not be reported as Connected even if it also emitted text.
+	if probe.sawToolCall || isToolCallStopReason(probe.stopReason) {
+		return lat, "", fmt.Errorf("the model returned a tool call instead of a text reply (finish_reason=%q)", probe.stopReason)
 	}
 	// err==nil is not enough: requests that go through while the model emits nothing
 	// at all really happen (thinking burned the whole budget, the body got swallowed
@@ -667,4 +730,52 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 		return lat, "", fmt.Errorf("the model returned no content (the request went through, but no text was returned)")
 	}
 	return lat, reply, nil
+}
+
+// connTestProvider observes the raw provider response during TestConnection so
+// tool-call replies and tool_calls/tool_use stop reasons are rejected (#526).
+type connTestProvider struct {
+	inner       llm.Provider
+	sawToolCall bool
+	stopReason  string
+}
+
+func (p *connTestProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		for ev, err := range p.inner.Stream(ctx, req) {
+			if err == nil {
+				if ev.Type == llm.SEToolUseStart {
+					p.sawToolCall = true
+				}
+				if ev.StopReason != "" {
+					p.stopReason = ev.StopReason
+				}
+			}
+			if !yield(ev, err) {
+				return
+			}
+		}
+	}
+}
+
+func (p *connTestProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	msg, stopReason, usage, err := p.inner.Complete(ctx, req)
+	if err == nil {
+		if len(msg.ToolUses()) > 0 {
+			p.sawToolCall = true
+		}
+		if stopReason != "" {
+			p.stopReason = stopReason
+		}
+	}
+	return msg, stopReason, usage, err
+}
+
+func isToolCallStopReason(stopReason string) bool {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "tool_use", "tool_calls":
+		return true
+	default:
+		return false
+	}
 }

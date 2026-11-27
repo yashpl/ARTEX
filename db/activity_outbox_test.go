@@ -20,9 +20,9 @@ func TestActivityOutboxKeepsDetail(t *testing.T) {
 func TestFlushActivityOutboxReplaysOnce(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	expID, err := d.CreateExploration("outbox", "replay")
 	if err != nil {
 		t.Fatal(err)
@@ -63,9 +63,9 @@ func TestFlushActivityOutboxReplaysOnce(t *testing.T) {
 func TestFlushActivityOutboxDropsStuckRow(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	const missing = int64(9_000_000_000_001)
 	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM activity_outbox WHERE exploration_id=$1`, missing) })
 	es := d.Exploration(missing)

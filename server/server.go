@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,14 +16,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/archivestore"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/intercept"
@@ -52,6 +56,11 @@ type Server struct {
 
 	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
 
+	execPriv  ExecPrivilege   // identity agent processes run under; zero keeps the server's own
+	isolation IsolationStatus // result of the startup isolation self-test (isolation.go); zero when not run
+
+	chatBridges *chatBridgeRunner // inbound chat bridges (issue #5); nil without PostgreSQL
+
 	setupMu    sync.Mutex
 	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
 	// pwdVersion is auth.password_version, a counter. Zero means no password
@@ -65,6 +74,14 @@ type Server struct {
 	authHashKey    string
 	authVersionKey string
 
+	// Test-only seams for pgListModels SSRF checks. All remain zero/nil in
+	// production (strict public-only default; only exact host:port entries in
+	// ARTEX_LLM_PRIVATE_ENDPOINTS may resolve to private addresses).
+	allowLoopbackModels bool
+	modelLookupIP       func(ctx context.Context, host string) ([]netip.Addr, error)
+	modelDialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
+	modelRootCAs        *x509.CertPool
+
 	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
 	pwdLimit       *loginLimiter  // attempt limit on POST /api/auth/change-password (IP + session token)
 	trustedProxies []netip.Prefix // ARTEX_TRUSTED_PROXIES; see clientIP
@@ -73,6 +90,8 @@ type Server struct {
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
 	concMu sync.Mutex
+
+	readyPG readyCache
 
 	cfgMu     sync.Mutex
 	chatAgent *agent.ChatAgent // conversational runner for the chat page; nil w/o LLM
@@ -145,9 +164,11 @@ type Server struct {
 
 	// Cold task archives run through one persistent FIFO worker. The buffered wake
 	// channel coalesces enqueue bursts; the database remains the source of truth.
-	archiveWake chan struct{}
-	archiveWG   sync.WaitGroup
-	side        *sideQuestionState
+	archiveWake     chan struct{}
+	archiveWG       sync.WaitGroup
+	archiveStore    *archivestore.Store
+	archiveStoreErr error
+	side            *sideQuestionState
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -256,8 +277,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		})
-		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
-		domainReg := buildDomainReg(m.Assets())
+		wireAgentAugment(m.pg, s.skillDir, s.hostTools, s.execPriv) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
+		domainReg := s.buildDomainReg()
 		wireTools(m.pg, domainReg)   // built-in tools table: filter per agent + override description/schema + inject defaults
 		seedPrompts(m.pg)            // seed built-in agent default prompt bodies into agent_prompts (only when empty)
 		warnBrokenSkills(s.skillDir) // surface skills whose frontmatter silently failed to parse
@@ -271,6 +292,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// Vulnerability IM push delivery engine. Sits beside the Scheduler but independent: push latency demands (3s)
 		// differ from the triggers' business cadence, and neither's failures drag the other down — a stuck push must not affect agent triggers.
 		go newNotifier(s).Run(s.ctx)
+		// Inbound chat bridges: an operator drives ARTEX from a chat app. Off until a bridge is enabled,
+		// and only allowlisted chats are served; long polling only, so no inbound port is opened.
+		s.chatBridges = newChatBridgeRunner(m.pg)
+		go s.chatBridges.Run(s.ctx)
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -289,8 +314,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
-	// Both env readers have now run (NewManager for the DSN, FromEnv above for the
-	// keys). Drop the secrets before anything below can spawn a child process:
+	s.initTaskArchiveStore()
+	// Startup env readers have now run (NewManager for the DSN, the LLM provider
+	// and archive store for their credentials). Drop the secrets before anything
+	// below can spawn a child process:
 	// restoring runtimes resumes workers that run shells, and MCP discovery starts
 	// stdio servers.
 	if s.scrubSecrets {
@@ -412,6 +439,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
 	// Ollama profiles run keyless (local server); the other formats need a key.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
@@ -440,9 +468,15 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var sessionHeaderKey string
 	var userAgent string
 	var retry db.RetryOverride
+	clearCustomHeaders := format != "bedrock-gateway"
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
 			if p.Name == "default" {
+				// A header saved for one gateway must not follow the legacy
+				// endpoint's default profile to another destination.
+				if !sameLLMEndpoint(format, cfg.BaseURL, p.Format, p.BaseURL) {
+					clearCustomHeaders = true
+				}
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
@@ -458,7 +492,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
-		Retry: retry,
+		Retry: retry, CustomHeaders: cfg.CustomHeaders, ClearCustomHeaders: clearCustomHeaders,
 	})
 	if err != nil {
 		return err
@@ -591,6 +625,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
@@ -745,6 +780,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
 
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/ready", s.ready)
 	mux.HandleFunc("GET /api/stats", s.stats)
 	mux.HandleFunc("GET /api/logs", s.getLogs)
 	mux.HandleFunc("GET /api/logs/history", s.getLogsHistory)
@@ -884,9 +920,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
 	mux.HandleFunc("POST /api/traffic/ingest", s.ingestTraffic)
 	mux.HandleFunc("POST /api/traffic/replay", s.replayTraffic)
+	mux.HandleFunc("POST /api/traffic/import/har", s.importTrafficHAR)
+	mux.HandleFunc("GET /api/traffic/export/har", s.exportTrafficHAR)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // aggregate call counts per tool
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
+	mux.HandleFunc("GET /api/llm/context/summary", s.pgLLMContextSummary)
 	mux.HandleFunc("DELETE /api/llm/records", s.pgDeleteLLMRecords)
 	mux.HandleFunc("GET /api/llm/records/tasks", s.pgLLMTasks)
 	mux.HandleFunc("GET /api/llm/records/by-model", s.pgTokenByModel) // aggregate this task's token usage by model
@@ -904,6 +943,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/notify/channels/{id}/test", s.notifyTestChannel)
 	mux.HandleFunc("GET /api/notify/deliveries", s.notifyListDeliveries)
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
+	// Inbound chat bridges, one per transport kind (telegram).
+	mux.HandleFunc("GET /api/chat-bridges", s.chatBridgeList)
+	mux.HandleFunc("PUT /api/chat-bridges/{kind}", s.chatBridgeSave)
+	mux.HandleFunc("POST /api/chat-bridges/{kind}/test", s.chatBridgeTest)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
@@ -1016,6 +1059,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic/rewrite-rules/{id}", s.rewriteDeleteRule)
 	mux.HandleFunc("POST /api/traffic/rewrite-rules/{id}/toggle", s.rewriteToggleRule)
 
+	// capture-proxy constrained Go tampering hooks (P4.2, operator-only, opt-in via ARTEX_TAMPER_HOOKS_ENABLED)
+	mux.HandleFunc("GET /api/traffic/hooks", s.tamperListHooks)
+	mux.HandleFunc("POST /api/traffic/hooks", s.tamperCreateHook)
+	mux.HandleFunc("PUT /api/traffic/hooks/{id}", s.tamperUpdateHook)
+	mux.HandleFunc("DELETE /api/traffic/hooks/{id}", s.tamperDeleteHook)
+	mux.HandleFunc("POST /api/traffic/hooks/{id}/toggle", s.tamperToggleHook)
+	mux.HandleFunc("GET /api/traffic/hooks/{id}/versions", s.tamperListHookVersions)
+	mux.HandleFunc("POST /api/traffic/hooks/{id}/rollback", s.tamperRollbackHook)
+	mux.HandleFunc("POST /api/traffic/hooks/dry-run", s.tamperDryRunHook)
+
 	// asset interception rule management (global blocklist: domains/IPs/URLs/CIDRs)
 	mux.HandleFunc("GET /api/asset-intercept/rules", s.assetInterceptListRules)
 	mux.HandleFunc("POST /api/asset-intercept/rules", s.assetInterceptCreateRule)
@@ -1047,8 +1100,13 @@ func (s *Server) Handler() http.Handler {
 	api := cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
-	root.Handle("/", s.webuiHandler())
-	return limitRequestBody(root)
+	webui := s.webuiHandler()
+	root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Document-only headers; the shared ones come from securityHeaders.
+		consoleHeaders(w.Header())
+		webui.ServeHTTP(w, r)
+	})
+	return s.securityHeaders(limitRequestBody(root))
 }
 
 // --- handlers ---
@@ -1062,6 +1120,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"ok": true, "service": "artex", "version": BuildVersion}
+	// The web UI shows a banner on every page for a degraded isolation (isolation.go).
+	if s.isolation.Mode != "" {
+		out["isolation"] = s.isolation
+	}
 	// Opt-in only (ARTEX_UPDATE_CHECK); off, this returns "" without any request.
 	if latest := updates.newerVersion(r.Context(), time.Now(), BuildVersion); latest != "" {
 		out["latest_version"] = latest
@@ -1165,8 +1227,15 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[tasks] list metrics query failed — metrics zeroed: %v", err)
 	}
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
+	// company keeps the tasks scoped to that company (the sidebar switcher). A
+	// non-numeric id, or one no task is scoped to, returns an empty list.
+	companyParam := strings.TrimSpace(r.URL.Query().Get("company"))
+	companyID, companyErr := strconv.ParseInt(companyParam, 10, 64)
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
+		if companyParam != "" && (companyErr != nil || !slices.Contains(t.lifecycleSnapshot().CompanyIDs, companyID)) {
+			continue
+		}
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
 		s.applyTaskMetrics(&dto, t, metrics[t.ExpID])
@@ -1448,6 +1517,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		ContextWindowK  int     `json:"context_window_k"`
 		ThinkingType    string  `json:"thinking_type"`
 		ReasoningEffort string  `json:"reasoning_effort"`
+		CustomHeaders   string  `json:"custom_headers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1462,18 +1532,26 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	cfg.CustomHeaders = req.CustomHeaders
 	if k := req.ContextWindowK; k > 0 { // 0 = keep default (200K); cap at 1M
 		if k > 1000 {
 			k = 1000
 		}
 		cfg.ContextWindowK = k
 	}
-	// Keyless formats (Ollama) need no key; the others keep/require one.
-	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
-		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
-		s.cfgMu.Unlock()
+	// A rotated token at the same gateway still uses that gateway's saved
+	// headers. Neither secret follows a changed endpoint.
+	s.cfgMu.Lock()
+	if sameLLMEndpoint(req.Provider, req.BaseURL, s.llmCfg.Provider(), s.llmCfg.BaseURL) {
+		if cfg.APIKey == "" && cfg.NeedsAPIKey() {
+			cfg.APIKey = s.llmCfg.APIKey
+		}
+		if cfg.CustomHeaders == "" && cfg.Format == agent.FormatBedrockGateway {
+			cfg.CustomHeaders = s.llmCfg.CustomHeaders
+		}
 	}
+	s.cfgMu.Unlock()
+	// Keyless formats (Ollama) need no key; the others keep/require one.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		writeErr(w, 400, "api_key required")
 		return
@@ -1514,6 +1592,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
 		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
 		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
+		CustomHeaders    string `json:"custom_headers"`
+		// Which request key carries the output cap (openai format only): "" = max_tokens,
+		// "max_completion_tokens" = the newer key. Omitted (nil) = the stored profile's choice.
+		MaxTokensField *string `json:"max_tokens_field"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1572,6 +1654,18 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	if req.Streaming != nil {
 		cfg.Stream = *req.Streaming
 	}
+	// The output-cap key follows the profile as well: OpenAI reasoning models reject
+	// max_tokens with unsupported_parameter, so a profile set to max_completion_tokens
+	// must be tested with that key, or the test 400s while conversations would work.
+	// Same normalization as saving a profile: only openai + the known value survives.
+	if req.MaxTokensField != nil {
+		cfg.MaxTokensField = strings.TrimSpace(*req.MaxTokensField)
+	} else if stored != nil {
+		cfg.MaxTokensField = stored.MaxTokensField
+	}
+	if cfg.Format != llm.FormatOpenAI || cfg.MaxTokensField != llm.MaxTokensFieldCompletion {
+		cfg.MaxTokensField = ""
+	}
 	// The custom session header name follows that profile too: when non-empty, the test request also sends it (value is a one-off random session id,
 	// see TestConnection). Endpoints like opencode zen that mandate x-opencode-session return
 	// 400 without it, so the test path must send it too — otherwise "chat works, test 400s".
@@ -1595,6 +1689,14 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.UserAgent = ua
+	cfg.CustomHeaders = req.CustomHeaders
+	if stored != nil && cfg.CustomHeaders == "" && sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+		cfg.CustomHeaders = stored.CustomHeaders
+	}
+	if _, err := agent.ParseBedrockGatewayHeaders(cfg.CustomHeaders); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	// Keyless formats (Ollama) skip the key resolution entirely.
 	if cfg.NeedsAPIKey() {
 		// API key resolution precedence: form input > the named profile's stored key > the global config's key.
@@ -1620,6 +1722,9 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			if global.APIKey != "" {
 				if sameLLMEndpoint(req.Provider, req.BaseURL, global.Provider(), global.BaseURL) {
 					cfg.APIKey = global.APIKey
+					if cfg.CustomHeaders == "" {
+						cfg.CustomHeaders = global.CustomHeaders
+					}
 				} else {
 					withheld = true
 				}
@@ -1866,11 +1971,33 @@ var (
 	reDomain = regexp.MustCompile(`\b((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})(?::(\d{1,5}))?`)
 )
 
+// trimURLTail drops sentence punctuation that free text puts after a URL
+// ("Assess http://host:3000."). A closing bracket is dropped only when it has no
+// opener in the URL, so "http://[::1]" keeps its "]".
+func trimURLTail(s string) string {
+	for s != "" {
+		r, size := utf8.DecodeLastRuneInString(s)
+		switch r {
+		case '.', ',', ';', ':', '!', '?', '。', '，', '、', '；', '：', '！', '？', '”', '’':
+		case ')', ']', '}', '>':
+			open := string("([{<"[strings.IndexRune(")]}>", r)])
+			if strings.Count(s, open) >= strings.Count(s, string(r)) {
+				return s
+			}
+		default:
+			return s
+		}
+		s = s[:len(s)-size]
+	}
+	return s
+}
+
 // parseTarget extracts a target (scheme, host, port) from free text, supporting
 // full URLs, IP[:port] and domain[:port]. ok=false when nothing parseable.
 func parseTarget(text string) (scheme, host string, port int, ok bool) {
 	text = strings.TrimSpace(text)
 	if m := reURL.FindString(text); m != "" {
+		m = trimURLTail(m)
 		if u, err := url.Parse(m); err == nil && u.Hostname() != "" {
 			scheme = strings.ToLower(u.Scheme)
 			host = strings.ToLower(u.Hostname())
@@ -2193,9 +2320,10 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	taskParam := q.Get("task")
 	if taskParam == "" {
 		// With page/limit → server-side pagination {items,total,...}; without → a bare array (for dashboard aggregation,
-		// same compat policy as the intents endpoint). Filtering/sorting is pushed down to SQL uniformly.
+		// same compat policy as the intents endpoint). Filtering/sorting is pushed down to SQL uniformly, and the bare
+		// array honours the filters too: the dashboard narrows by the active company through asset_scope.
 		if q.Get("page") == "" && q.Get("limit") == "" {
-			fs, _ := s.m.pg.ListFindings(500)
+			fs, _ := s.m.pg.ListFindingsFiltered(findingFilterFromQuery(q), 500)
 			assets := s.resolveFindingAssets(fs)
 			out := make([]FindingDTO, 0, len(fs))
 			for _, f := range fs {
@@ -2323,7 +2451,8 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 // findingStats serves the whole-table aggregates (stat cards + vuln-class filter)
 // for the paginated Findings page.
 func (s *Server) findingStats(w http.ResponseWriter, r *http.Request) {
-	st, err := s.m.pg.FindingStats()
+	// company narrows the cards to the sidebar's company, with the list's rule.
+	st, err := s.m.pg.FindingStatsForCompany(r.URL.Query().Get("company"))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -3308,7 +3437,7 @@ func (s *Server) getLogsHistory(w http.ResponseWriter, r *http.Request) {
 			TS:    r.CreatedAt.Format(time.RFC3339),
 			Level: r.Level,
 			Tag:   r.Tag,
-			Text:  r.Text,
+			Text:  maskURLCredentials(r.Text), // rows written before the sink masked them
 		})
 	}
 	writeJSON(w, 200, map[string]any{"items": items, "has_more": len(rows) == limit})
@@ -3514,24 +3643,23 @@ func taskActivityDetail(t *Task, seq int64) (string, error) {
 func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	tr := s.m.Traffic()
 	if tr == nil {
-		writeJSON(w, 200, map[string]any{"enabled": false, "exchanges": []any{}})
+		writeJSON(w, 200, map[string]any{"enabled": false, "exchanges": []any{}, "rewrite": traffic.RewriteStats{}})
 		return
 	}
 	q := r.URL.Query()
 	page := atoiDefault(q.Get("page"), 0)
 	size := atoiDefault(q.Get("size"), 100)
-	ex, matched, _ := tr.Page(traffic.PageQuery{
-		Host:    q.Get("host"),
-		Method:  q.Get("method"),
-		Query:   q.Get("q"),
-		Body:    q.Get("body"),
-		Path:    q.Get("path"),
-		Status:  q.Get("status"),
-		RespMin: int64(atoiDefault(q.Get("resp_min"), -1)),
-		RespMax: int64(atoiDefault(q.Get("resp_max"), -1)),
-		Sort:    q.Get("sort"),
-		Order:   q.Get("order"),
-	}, page, size)
+	// company narrows the list to the hosts that company owns, so the page
+	// follows the sidebar switcher like every other asset-backed view.
+	hosts, err := s.companyHosts(int64(atoiDefault(q.Get("company"), 0)))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	pq := parseTrafficPageQuery(q)
+	pq.Hosts = hosts
+	pq.MatchNone = q.Get("company") != "" && len(hosts) == 0 // a company owning no host matches nothing
+	ex, matched, _ := tr.Page(pq, page, size)
 	count, _ := tr.Count() // global total, for the stat card
 	writeJSON(w, 200, map[string]any{
 		"enabled":   s.m.TrafficEnabled(), // reflect the capture toggle
@@ -3541,6 +3669,7 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 		"page":      page,
 		"size":      size,
 		"exchanges": trafficDTOs(ex),
+		"rewrite":   tr.RewriteStats(),
 	})
 }
 
@@ -3666,7 +3795,9 @@ func (s *Server) getTrafficExchange(w http.ResponseWriter, r *http.Request) {
 }
 
 // getTrafficStream returns one page of a WebSocket/SSE exchange's messages in
-// order (limit 1..200, default 50).
+// order (limit 1..200, default 50). direction=c2s or s2c keeps one side of the
+// conversation (plus the meta limit marker); any other non-empty value is a 400.
+// total counts rows for pagination; message_total excludes meta limit markers.
 func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 	tr := s.m.Traffic()
 	if tr == nil {
@@ -3681,12 +3812,17 @@ func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 	}
 	offset, _ := strconv.Atoi(q.Get("offset"))
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	msgs, total, err := tr.StreamMessages(id, offset, limit)
+	direction := strings.ToLower(strings.TrimSpace(q.Get("direction")))
+	page, err := tr.StreamMessagePageByDirection(id, direction, offset, limit)
+	if errors.Is(err, traffic.ErrBadStreamDirection) {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": msgs, "total": total})
+	writeJSON(w, 200, page)
 }
 
 // maxReplayRequestBytes bounds the replay request body (JSON, with the payload
@@ -3713,6 +3849,7 @@ func (s *Server) replayTraffic(w http.ResponseWriter, r *http.Request) {
 		Headers    []traffic.ReplayHeader `json:"headers"`
 		Body       string                 `json:"body"`
 		BodyBase64 bool                   `json:"body_base64"`
+		ApplyRules bool                   `json:"apply_rules"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		var tooLarge *http.MaxBytesError
@@ -3734,7 +3871,13 @@ func (s *Server) replayTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	res, err := tr.Replay(ctx, traffic.ReplayRequest{Method: body.Method, URL: body.URL, Headers: body.Headers, Body: payload})
+	res, err := tr.Replay(ctx, traffic.ReplayRequest{
+		Method:     body.Method,
+		URL:        body.URL,
+		Headers:    body.Headers,
+		Body:       payload,
+		ApplyRules: body.ApplyRules,
+	})
 	switch {
 	case errors.Is(err, traffic.ErrReplayTooLarge):
 		writeErr(w, 413, err.Error())
@@ -3802,6 +3945,8 @@ func (s *Server) settingsPayload() map[string]any {
 	return map[string]any{
 		"traffic_capture":          s.m.TrafficEnabled(),
 		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"triage_profile_id":        s.triageProfileID(),
+		"triage_min_confidence":    s.triageMinConfidence(),
 		"llm_record":               s.m.LLMRecordEnabled(),
 		"web_search_enabled":       on,
 		"web_search_backend":       backend,
@@ -3903,6 +4048,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// operation-constraint injection scope switches (default both on); take effect immediately (planner/worker read them every round), no agent rebuild needed.
 		ConstraintsInjectPlanner *bool `json:"constraints_inject_planner"`
 		ConstraintsInjectWorker  *bool `json:"constraints_inject_worker"`
+		// Triage profile: an llm_profiles row serving the decision-model (/v1/systemone)
+		// contract, used for closed-list judgements (report_finding dedup). 0/null-safe:
+		// omit = keep, 0 = off. Read per agent run, so it applies to runs started afterwards.
+		TriageProfileID *int64 `json:"triage_profile_id"`
+		// Suppression threshold for a duplicate answer (0..1). Lower catches more real
+		// duplicates and risks suppressing a distinct one; the caller is told to
+		// re-register in that case, which is what makes the low end affordable.
+		TriageMinConfidence *float64 `json:"triage_min_confidence"`
 		// Experimental: noa context compaction switch (default off); read per run, applies to runs started afterwards, no agent rebuild needed.
 		NoaCompaction *bool `json:"noa_compaction"`
 		// Vulnerability IM push global settings. The delivery engine re-reads all three every round, so changes
@@ -3934,6 +4087,26 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		egress.SetProfile(noise)
 	}
+	// Triage settings are checked before either is stored. A profile id that does
+	// not exist resolves to "off" at run time, which reads as a broken dedup rather
+	// than as a rejected setting; a threshold outside 0..1 is silently ignored by
+	// the agent. Reject both here instead of storing them.
+	if req.TriageProfileID != nil {
+		if *req.TriageProfileID < 0 {
+			writeErr(w, 400, "triage_profile_id must be >= 0 (0 turns the duplicate check off)")
+			return
+		}
+		if *req.TriageProfileID > 0 {
+			if p, err := s.m.pg.ProfileByID(*req.TriageProfileID); err != nil || p == nil {
+				writeErr(w, 400, fmt.Sprintf("triage_profile_id %d does not match any LLM profile", *req.TriageProfileID))
+				return
+			}
+		}
+	}
+	if req.TriageMinConfidence != nil && (*req.TriageMinConfidence < 0 || *req.TriageMinConfidence > 1) {
+		writeErr(w, 400, "triage_min_confidence must be between 0 and 1")
+		return
+	}
 	// A masked placeholder echoed back keeps the stored secret, like null.
 	req.BraveKey, req.TavilyKey, req.KeenableKey = keepIfMasked(req.BraveKey), keepIfMasked(req.TavilyKey), keepIfMasked(req.KeenableKey)
 	req.WebSearchProxy, req.GlobalProxy = keepIfMasked(req.WebSearchProxy), keepIfMasked(req.GlobalProxy)
@@ -3945,6 +4118,19 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ConstraintsInjectWorker != nil {
 		if err := s.m.pg.SetBool(settingConstraintsInjectWorker, *req.ConstraintsInjectWorker); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TriageMinConfidence != nil {
+		if err := s.m.pg.SetSetting(settingTriageMinConfidence, strconv.FormatFloat(*req.TriageMinConfidence, 'f', 3, 64)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		s.applyTriageThreshold()
+	}
+	if req.TriageProfileID != nil {
+		if err := s.m.pg.SetSetting(settingTriageProfile, strconv.FormatInt(*req.TriageProfileID, 10)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -4316,9 +4502,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			maTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 			resume := func() { s.reviveTask(t) } // set_goals added a goal → pulls the task back to running
 			// Splice the list of [absolute paths] of uploaded attachments into the message sent to the agent; it uses them to open files via Read/Bash.
-			// taskDir = the agent's working directory (CWD), consistent with chatUpload's target dir and ensureRunDir.
-			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
-			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
+			// mainDir = the main agent's run directory (its CWD, tasks/<id>/main), the same call as chatUpload's target dir and the agent itself.
+			mainDir := agent.EnsureRunDir(s.m.dir, maTaskID, 0)
+			agentMsg := composeAgentMessage(agentMessage, req.Attachments, mainDir)
 			// Tag the turn for the target gate: the task, the "mainagent" lane and the approval scope.
 			gctx := intercept.WithTaskContext(ctx, t.ID, "mainagent", func(a db.Activity) {
 				a.Worker = "mainagent"
@@ -4422,14 +4608,8 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // pure vulnerabilities (facts are a separate KindFact and never enter the report)
-	counts := map[string]int{}
-	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
-		if len(ns) > 0 {
-			counts[ty] = len(ns)
-		}
-	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	counts, _ := s.m.Assets().CountsByTypeForTask(taskID)
 	var ledger *db.CoverageLedger
 	if t.CoverageEnabled {
 		ledger, _ = s.m.Assets().CoverageLedger(taskID)

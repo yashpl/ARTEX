@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -31,9 +33,23 @@ func TestRenderTemplateCommand(t *testing.T) {
 
 func TestRenderTemplateHTTP(t *testing.T) {
 	// http: identity (no shell quoting) — raw substitution into url/body.
-	got := renderTemplate("https://x/submit?flag={flag}", map[string]any{"flag": "CTF{abc}"}, identity)
+	// abc is a real param; braces inside the flag value must stay literal.
+	got := renderTemplate("https://x/submit?flag={flag}", map[string]any{
+		"flag": "CTF{abc}",
+		"abc":  "nope",
+	}, identity)
 	if got != "https://x/submit?flag=CTF{abc}" {
 		t.Fatalf("http render: %q", got)
+	}
+}
+
+func TestRenderTemplateDoesNotRescanValues(t *testing.T) {
+	got := renderTemplate("cmd {a} {missing}", map[string]any{
+		"a": "{b}",
+		"b": "; id",
+	}, shellQuote)
+	if got != "cmd '{b}' {missing}" {
+		t.Fatalf("render = %q", got)
 	}
 }
 
@@ -96,7 +112,7 @@ print("port=" + str(a["port"]))
 `
 	out, err := execPython(context.Background(), interp, "test", code,
 		map[string]any{"target": "example.com", "port": float64(8080)},
-		t.TempDir(), nil, 10*time.Second)
+		t.TempDir(), nil, 10*time.Second, ExecPrivilege{})
 	if err != nil {
 		t.Fatalf("execPython error: %v", err)
 	}
@@ -104,6 +120,20 @@ print("port=" + str(a["port"]))
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// With the privilege drop on and no script directory, execPython fails closed: it
+// must not fall back to writing the script under the run directory.
+func TestExecPythonNeedsScriptDirWhenDropping(t *testing.T) {
+	work := t.TempDir()
+	_, err := execPython(context.Background(), "python3", "test", "print(1)", nil, work, nil, time.Second,
+		ExecPrivilege{Enabled: true, UID: DefaultExecUID, GID: DefaultExecGID})
+	if err == nil {
+		t.Fatal("execPython ran without a script directory")
+	}
+	if _, err := os.Lstat(filepath.Join(work, ".tools")); err == nil {
+		t.Fatal(".tools was created under the run directory")
 	}
 }
 

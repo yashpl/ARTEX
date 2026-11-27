@@ -26,7 +26,15 @@ func callReadJSON(t *testing.T, tool actool.CoreTool, input string) any {
 }
 
 func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
-	t.Skip("known failure with a fresh database, pre-existing on unmodified upstream; tracked in BaaRai/ARTEX#9")
+	// Known failure with a freshly seeded database (BaaRai/ARTEX#9). Repro:
+	//   ARTEX_PG_DSN=postgres://artex:testpass@localhost:5432/artextest_agent \
+	//     go test ./agent -run TestGraphOverviewExpandsAssociatedCompanyScope -count=1 -v
+	// On a fresh DB the company-scope expansion in graphOverviewData is not
+	// visible to the task: the t.Fatalf checks after QueryByTask and
+	// graphOverviewData (company asset linkage, company_scope rows and
+	// company_keywords) fail. Keep the skip until seeding is ordered correctly;
+	// do not delete it.
+	t.Skip("known failure with a fresh database; repro and failing assertions documented above; BaaRai/ARTEX#9")
 	d := testDB(t)
 	defer d.Close()
 
@@ -186,7 +194,7 @@ func companiesName(t *testing.T, companies *db.CompanyStore, companyID int64) st
 
 func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	grand, err := d.CreateTask("grand", "grand goal", nil, 0, 0)
 	if err != nil {
@@ -370,7 +378,7 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 // model which ids it deferred, after de-duplicating and dropping invalid ids.
 func TestGetWorkerTraceStepIDsDegradeGracefully(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	task, err := d.CreateTask("trace-cap", "goal", nil, 0, 0)
 	if err != nil {

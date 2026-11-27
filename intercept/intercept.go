@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"regexp"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -96,6 +98,8 @@ type TargetScope struct {
 	Enabled        func() bool
 	WaitBound      time.Duration
 	Interceptor    *Interceptor
+
+	AssessmentIdentity config.AssessmentIdentity // operator-configured identity of this task only
 }
 
 // WithTargetScope returns a child context carrying the target-gate scope of the
@@ -111,15 +115,17 @@ func TargetScopeFromContext(ctx context.Context) (s TargetScope, ok bool) {
 }
 
 // compiledRule is an InterceptRule with the regex pre-compiled (nil for string rules)
-// and the argv tokens pre-parsed (nil for non-argv rules).
+// and the argv tokens pre-parsed (nil for non-argv rules). bad marks a deny or
+// ask rule whose pattern does not compile: it matches every call, as a deny.
 type compiledRule struct {
 	db.InterceptRule
 	re   *regexp.Regexp
 	argv []string
+	bad  bool
 }
 
 // compileRule prepares a rule for matching. ok is false for a rule whose
-// pattern does not compile; such a rule is skipped rather than crashing.
+// pattern does not compile; see loadLocked for what happens to it.
 func compileRule(r db.InterceptRule) (compiledRule, bool) {
 	cr := compiledRule{InterceptRule: r}
 	switch r.MatchType {
@@ -205,12 +211,16 @@ type Interceptor struct {
 	mu           sync.RWMutex
 	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
 	enabledTools map[string]bool // nil means not loaded yet
+	loadFailed   bool            // the last load failed; its error has been logged
 	pending      *pendingManager
 	reviewer     Reviewer  // nil = freeform LLM fallback judge not wired
 	completer    Completer // nil = closed-question judge not wired
 	// upstreamProxy reports whether target traffic leaves through an upstream
 	// egress proxy (nil = no). Injected by the server layer.
 	upstreamProxy func() bool
+	// toolProxy reports whether one tool's own configuration routes its traffic
+	// through a proxy (nil = no). Injected by the server layer.
+	toolProxy func(string) bool
 	// derivedExempt lists the endpoints of the platform's own services (nil =
 	// none). Injected by the server layer. See SetDerivedExemptions.
 	derivedExempt func() []string
@@ -234,6 +244,15 @@ func (i *Interceptor) SetUpstreamProxyCheck(f func() bool) {
 	i.mu.Unlock()
 }
 
+// SetToolProxyCheck installs the function that reports whether a tool sends its
+// own traffic through a proxy. The proxy then chooses the address it connects
+// to, so a target approval for that call is name-only. Passing nil disables it.
+func (i *Interceptor) SetToolProxyCheck(f func(string) bool) {
+	i.mu.Lock()
+	i.toolProxy = f
+	i.mu.Unlock()
+}
+
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
 func (i *Interceptor) SetReviewer(r Reviewer) {
 	i.mu.Lock()
@@ -254,6 +273,10 @@ var defaultEnabledTools = []string{
 	"Bash", "WebFetch", "web_search",
 	"shell_open", "shell_send",
 	"Write", "Edit", "MultiEdit",
+	// ExecuteExtraTool dispatches MCP and deferred tools, and Monitor starts a
+	// background command; both execute third-party or shell commands, so they
+	// belong in the default gate with the rest.
+	"ExecuteExtraTool", "Monitor",
 }
 
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
@@ -273,11 +296,24 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Unlock()
 }
 
+// loadLocked reads the rules and the enabled-tools setting. It installs both or,
+// when either read fails, neither: the callers then fail closed (IsToolEnabled
+// answers true, the matchers deny). The error is logged once per outage.
 func (i *Interceptor) loadLocked() error {
 	rules, err := i.db.ListInterceptRules()
+	var val string
+	var ok bool
+	if err == nil {
+		val, ok, err = i.db.GetSetting("intercept_enabled_tools")
+	}
 	if err != nil {
+		if !i.loadFailed {
+			i.loadFailed = true
+			slog.Error("[intercept] the rule store cannot be read; every tool call is denied until it can", "err", err)
+		}
 		return err
 	}
+	i.loadFailed = false
 	var out []compiledRule
 	for _, r := range rules {
 		if !r.Enabled {
@@ -285,33 +321,48 @@ func (i *Interceptor) loadLocked() error {
 		}
 		cr, ok := compileRule(r)
 		if !ok {
-			continue // skip rules with a bad pattern rather than crashing
+			if r.Action != "deny" && r.Action != "ask" {
+				continue // an allow rule with a bad pattern allows nothing
+			}
+			// A deny or ask rule that cannot be evaluated must not fail open.
+			cr.bad, cr.Action = true, "deny"
+			cr.Message = "intercept rule [" + r.Name + "] has a pattern that does not compile; calls are blocked until the rule is fixed or disabled"
 		}
 		out = append(out, cr)
 	}
 	i.cached = out
 
-	// Load enabled-tools set from settings, falling back to hard-coded defaults.
-	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
-	if !ok {
-		m := make(map[string]bool, len(defaultEnabledTools))
-		for _, n := range defaultEnabledTools {
-			m[n] = true
-		}
-		i.enabledTools = m
-	} else {
-		var names []string
-		if json.Unmarshal([]byte(val), &names) != nil {
-			i.enabledTools = map[string]bool{}
-		} else {
-			m := make(map[string]bool, len(names))
-			for _, n := range names {
-				m[n] = true
-			}
-			i.enabledTools = m
-		}
-	}
+	// Enabled-tools set from settings, falling back to hard-coded defaults.
+	i.enabledTools = enabledToolsFromSetting(val, ok)
 	return nil
+}
+
+// storeUnreadableDecision is what the matchers answer when the rules cannot be
+// loaded: a deny, so that a call is never let through unchecked.
+func storeUnreadableDecision() Decision {
+	return Decision{Action: "deny", Message: "the intercept rules could not be loaded, so the call cannot be checked; it is blocked until the rule store is readable again"}
+}
+
+// enabledToolsFromSetting maps the stored intercept_enabled_tools value to the
+// gate's set. A malformed value must not silently disable the gate, so it falls
+// back to the same defaults as an unset setting.
+func enabledToolsFromSetting(val string, ok bool) map[string]bool {
+	m := make(map[string]bool, len(defaultEnabledTools))
+	for _, n := range defaultEnabledTools {
+		m[n] = true
+	}
+	if !ok {
+		return m
+	}
+	var names []string
+	if json.Unmarshal([]byte(val), &names) != nil {
+		return m
+	}
+	m = make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
 }
 
 func (i *Interceptor) rules() ([]compiledRule, error) {
@@ -336,7 +387,8 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 
 // IsToolEnabled returns true if the named tool is in the intercept-enabled set
 // (i.e. it should enter the rule-matching path). Uses the same double-check lock
-// pattern as rules().
+// pattern as rules(). When the set cannot be loaded it answers true for every
+// tool, so the call reaches the rule path, where Match denies it.
 func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.RLock()
 	if i.enabledTools != nil {
@@ -349,7 +401,9 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.enabledTools == nil {
-		_ = i.loadLocked()
+		if err := i.loadLocked(); err != nil {
+			return true
+		}
 	}
 	return i.enabledTools[name]
 }
@@ -369,7 +423,7 @@ func (i *Interceptor) GetEnabledTools() ([]string, error) {
 	}
 	var names []string
 	if err := json.Unmarshal([]byte(val), &names); err != nil {
-		return []string{}, nil
+		return nil, fmt.Errorf("intercept_enabled_tools is not valid JSON: %w", err)
 	}
 	return names, nil
 }
@@ -655,11 +709,12 @@ func judgeActionLabel(action string) string {
 
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
-// (Decision{}, false) if no rule matches.
+// (Decision{}, false) if no rule matches. When the rules cannot be loaded it
+// returns a deny.
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
-	if err != nil || len(rules) == 0 {
-		return Decision{}, false
+	if err != nil {
+		return storeUnreadableDecision(), true
 	}
 	for _, r := range rules {
 		if ruleMatches(r, toolName, input) {
@@ -691,7 +746,7 @@ const builtinRulePrefix = "[built-in]"
 // enter the rule system. It returns the first match in priority order. User rules,
 // allow and ask rules, and the judge are not consulted. The planner and the main
 // agent use it (#124, F11). An interceptor without a database and without loaded
-// rules matches nothing.
+// rules matches nothing. When the rules cannot be loaded it returns a deny.
 func (i *Interceptor) MatchBuiltin(toolName string, input []byte) (Decision, bool) {
 	i.mu.RLock()
 	loaded := i.cached != nil
@@ -704,7 +759,7 @@ func (i *Interceptor) MatchBuiltin(toolName string, input []byte) (Decision, boo
 	}
 	rules, err := i.rules()
 	if err != nil {
-		return Decision{}, false
+		return storeUnreadableDecision(), true
 	}
 	for _, r := range rules {
 		if r.Action != "deny" || !strings.HasPrefix(r.Name, builtinRulePrefix) || !ruleMatches(r, toolName, input) {
@@ -751,14 +806,25 @@ func (i *Interceptor) SetRulesForTest(rules []db.InterceptRule) {
 }
 
 func ruleMatches(r compiledRule, toolName string, input []byte) bool {
+	if r.bad {
+		return true
+	}
 	if r.MatchType == "argv" {
 		// Bash only, on the parsed command; match_target is always tool_input.
-		// The denylist neutralises allow rules only: an argv deny or ask rule
-		// for a denylisted program still matches.
-		if r.Action == "allow" && CheckArgvAllow(r.argv) != nil {
-			return false
+		// Allow rules stay strictly limited to a single simple command with
+		// exact derived prefix and denylist enforcement. Deny and ask rules
+		// walk every call in a compound Bash command, stripping known wrappers
+		// and recursing into eval / shell -c payloads.
+		if r.Action == "allow" {
+			if CheckArgvAllow(r.argv) != nil {
+				return false
+			}
+			return r.MatchTarget == "tool_input" && argvRuleMatches(r.argv, toolName, input)
 		}
-		return r.MatchTarget == "tool_input" && argvRuleMatches(r.argv, toolName, input)
+		if r.Action == "deny" || r.Action == "ask" {
+			return r.MatchTarget == "tool_input" && argvCompoundMatches(r.argv, toolName, input)
+		}
+		return false
 	}
 	var subject string
 	switch r.MatchTarget {

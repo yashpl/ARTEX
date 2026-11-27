@@ -82,9 +82,9 @@ func TestResetSettledRunReseedsBudgetFromUsage(t *testing.T) {
 	t.Setenv("ARTEX_TASK_BUDGET_TOKENS", "100000")
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		pgdb.SkipPGUnavailable(t, err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 
 	taskID := strconv.FormatInt(time.Now().UnixNano(), 10)
 	t.Cleanup(func() {

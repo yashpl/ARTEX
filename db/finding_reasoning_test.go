@@ -10,7 +10,7 @@ import (
 func TestFindingReasoningFieldsRoundTrip(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 	tk, err := d.CreateTask("finding reasoning fields", "goal", nil, 0, 0)
@@ -24,10 +24,12 @@ func TestFindingReasoningFieldsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer d.DeleteFinding(with.FindingID)
 	without, err := es.RecordFinding(t.Context(), RecordFindingInput{TaskID: tk.ID, VulnClass: "IDOR", Severity: "low", Summary: "without reasoning", Worker: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer d.DeleteFinding(without.FindingID)
 	want := map[int64][2]string{
 		with.FindingID:    {"UUID guessing returned 404", "two accounts, same response body"},
 		without.FindingID: {"", ""},

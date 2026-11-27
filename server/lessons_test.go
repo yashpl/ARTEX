@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 func TestRSILessonsMode(t *testing.T) {
@@ -23,7 +25,7 @@ func TestRSILessonsMode(t *testing.T) {
 func TestTaskLessonsExtractionAndIdempotency(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	if _, err := m.pg.Exec(`DELETE FROM rsi_lessons`); err != nil {
@@ -34,7 +36,10 @@ func TestTaskLessonsExtractionAndIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer func() { _ = m.pg.DeleteTask(taskID) }()
+	defer func() {
+		_, _ = m.pg.DeleteFindingsByTask(taskID)
+		_ = m.pg.DeleteTask(taskID)
+	}()
 	defer func() { _, _ = m.pg.Exec(`DELETE FROM rsi_lessons`) }()
 
 	if _, err := m.pg.Exec(`
@@ -124,7 +129,7 @@ SELECT id,'completed','fixed','{}'::jsonb FROM findings WHERE task_id=$1 AND nam
 func TestTerminalStatusExtractsLessons(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	if _, err := m.pg.Exec(`DELETE FROM rsi_lessons`); err != nil {
@@ -136,7 +141,10 @@ func TestTerminalStatusExtractsLessons(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer func() { _ = m.pg.DeleteTask(taskID) }()
+	defer func() {
+		_, _ = m.pg.DeleteFindingsByTask(taskID)
+		_ = m.pg.DeleteTask(taskID)
+	}()
 	if _, err := m.pg.Exec(`
 INSERT INTO findings(task_id,vulnclass,name,summary,severity,status)
 VALUES ($1,'xss','Reflected XSS','reflected in search','high','confirmed')`, taskID); err != nil {

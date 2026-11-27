@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/url"
 	"reflect"
 	"strings"
@@ -152,10 +152,10 @@ func (s *sink) startStream(f *mproxy.Flow, kind string) {
 		if rewritten, ruleIDs := appliedRules(lines); rewritten {
 			var re *recordError
 			errors.As(err, &re)
-			log.Printf("[traffic] failed to record a rewritten %s stream of %s (%s; rules %v)", kind, f.Request.URL.Hostname(), re.step, ruleIDs)
+			slog.Error("[traffic] failed to record rewritten stream", "kind", kind, "host", f.Request.URL.Hostname(), "step", re.step, "rules", ruleIDs)
 			return
 		}
-		log.Printf("[traffic] failed to record %s stream %s: %v", kind, f.Request.URL, err)
+		slog.Error("[traffic] failed to record stream", "kind", kind, "url", f.Request.URL.String(), "err", err)
 		return
 	}
 	st.id = id
@@ -200,7 +200,7 @@ func lockLib(v any) (unlock func(), ok bool) {
 	mu := libMutex(v)
 	if mu == nil {
 		libMutexMissing.Do(func() {
-			log.Printf("[traffic] go-mitmproxy stream data has no mu field; stream messages are not recorded")
+			slog.Warn("[traffic] go-mitmproxy stream data has no mu field; stream messages are not recorded")
 		})
 		return nil, false
 	}
@@ -424,7 +424,7 @@ func (t *Traffic) persistStream(st *streamState, rows []streamRow) {
 
 	tx, err := t.db.Begin()
 	if err != nil {
-		log.Printf("[traffic] failed to record stream messages of %s (beginning transaction): %v", st.id, err)
+		slog.Error("[traffic] failed to record stream messages", "exchange_id", st.id, "step", "begin tx", "err", err)
 		return
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
@@ -436,12 +436,12 @@ func (t *Traffic) persistStream(st *streamState, rows []streamRow) {
 		if _, err := tx.Exec(`INSERT INTO stream_messages(exchange_id,seq,ts,direction,kind,event,event_id,retry,size,payload,payload_blob,truncated)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, st.id, p.seq, p.ts, p.direction, p.kind, p.event, p.eventID, p.retry, p.size,
 			inline, nullIfEmpty(p.body.hash), boolInt(p.truncated)); err != nil {
-			log.Printf("[traffic] failed to record stream message %d of %s: %v", p.seq, st.id, err)
+			slog.Error("[traffic] failed to record stream message", "seq", p.seq, "exchange_id", st.id, "err", err)
 			return
 		}
 		if p.body.hash != "" {
 			if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, p.body.hash, st.id); err != nil {
-				log.Printf("[traffic] failed to record stream message %d of %s (registering blob reference): %v", p.seq, st.id, err)
+				slog.Error("[traffic] failed to register stream message blob ref", "seq", p.seq, "exchange_id", st.id, "err", err)
 				return
 			}
 		}
@@ -449,12 +449,12 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, st.id, p.seq, p.ts, p.direction, p.kind, p.eve
 	if meta != nil {
 		if _, err := tx.Exec(`INSERT INTO stream_messages(exchange_id,seq,ts,direction,kind,size,payload)
 VALUES(?,?,?,'meta',0,?,?)`, st.id, metaSeq, time.Now().Unix(), len(meta), meta); err != nil {
-			log.Printf("[traffic] failed to record stream limit marker of %s: %v", st.id, err)
+			slog.Error("[traffic] failed to record stream limit marker", "exchange_id", st.id, "err", err)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		log.Printf("[traffic] failed to record stream messages of %s (committing): %v", st.id, err)
+		slog.Error("[traffic] failed to record stream messages", "exchange_id", st.id, "step", "commit", "err", err)
 	}
 }
 
@@ -493,12 +493,12 @@ func (t *Traffic) finishStream(st *streamState) {
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	if _, err := t.db.Exec(`UPDATE exchanges SET req_len=?, resp_len=? WHERE id=?`, st.reqBytes, st.respBytes, st.id); err != nil {
-		log.Printf("[traffic] failed to record stream sizes of %s: %v", st.id, err)
+		slog.Error("[traffic] failed to record stream sizes", "exchange_id", st.id, "err", err)
 	}
 	if st.dropped {
 		meta := streamMetaPayload(st)
 		if _, err := t.db.Exec(`UPDATE stream_messages SET payload=?, size=? WHERE exchange_id=? AND direction='meta'`, meta, len(meta), st.id); err != nil {
-			log.Printf("[traffic] failed to update stream limit marker of %s: %v", st.id, err)
+			slog.Error("[traffic] failed to update stream limit marker", "exchange_id", st.id, "err", err)
 		}
 	}
 }
@@ -523,11 +523,59 @@ type StreamMessage struct {
 	Truncated bool   `json:"truncated,omitempty"`
 }
 
+// StreamMessagePage keeps row totals for pagination separate from message
+// totals for display. Items and Total include any 'meta' limit marker;
+// MessageTotal counts only recorded WebSocket messages or SSE events.
+type StreamMessagePage struct {
+	Items        []StreamMessage `json:"items"`
+	Total        int             `json:"total"`
+	MessageTotal int             `json:"message_total"`
+}
+
 // StreamMessages returns one page of an exchange's stream messages in order.
 // limit is 1..200 (default 50) and offset >= 0. Every payload comes back as at
 // most streamPreview (4 KiB); a longer one lives in the blob store and the row
 // carries its hash for the rest (traffic_blob, GET /api/traffic/blob).
 func (t *Traffic) StreamMessages(exchangeID string, offset, limit int) ([]StreamMessage, int, error) {
+	return t.StreamMessagesByDirection(exchangeID, "", offset, limit)
+}
+
+// ErrBadStreamDirection is returned by StreamMessagesByDirection for a
+// direction other than "", "c2s" or "s2c".
+var ErrBadStreamDirection = errors.New(`direction must be "c2s", "s2c" or empty`)
+
+// streamDirectionFilter returns the SQL condition (after exchange_id=?) and its
+// argument for a direction filter. A filtered page keeps the 'meta' limit
+// marker, so a reader never misses that messages were dropped.
+func streamDirectionFilter(direction string) (cond string, args []any, err error) {
+	switch direction {
+	case "":
+		return "", nil, nil
+	case "c2s", "s2c":
+		return ` AND direction IN (?, 'meta')`, []any{direction}, nil
+	default:
+		return "", nil, ErrBadStreamDirection
+	}
+}
+
+// StreamMessagesByDirection is StreamMessages restricted to one direction:
+// "c2s" (client to server), "s2c" (server to client), or "" for both. total
+// counts only the matching rows, so offset pages through the filtered list.
+// The 'meta' row (messages dropped past the recorder's limits) is kept in a
+// filtered page. Seq stays the message's position in the whole stream.
+func (t *Traffic) StreamMessagesByDirection(exchangeID, direction string, offset, limit int) ([]StreamMessage, int, error) {
+	page, err := t.StreamMessagePageByDirection(exchangeID, direction, offset, limit)
+	return page.Items, page.Total, err
+}
+
+// StreamMessagePageByDirection returns the same rows and pagination total as
+// StreamMessagesByDirection, plus a message total that excludes limit markers.
+// Both totals cover the entire filtered stream, regardless of offset or limit.
+func (t *Traffic) StreamMessagePageByDirection(exchangeID, direction string, offset, limit int) (StreamMessagePage, error) {
+	cond, dirArgs, err := streamDirectionFilter(direction)
+	if err != nil {
+		return StreamMessagePage{}, err
+	}
 	if limit <= 0 {
 		limit = 50
 	}
@@ -537,24 +585,26 @@ func (t *Traffic) StreamMessages(exchangeID string, offset, limit int) ([]Stream
 	if offset < 0 {
 		offset = 0
 	}
-	var total int
-	if err := t.db.QueryRow(`SELECT COUNT(*) FROM stream_messages WHERE exchange_id=?`, exchangeID).Scan(&total); err != nil {
-		return nil, 0, err
+	var page StreamMessagePage
+	args := append([]any{exchangeID}, dirArgs...)
+	if err := t.db.QueryRow(`SELECT COUNT(*), COUNT(CASE WHEN direction <> 'meta' THEN 1 END)
+FROM stream_messages WHERE exchange_id=?`+cond, args...).Scan(&page.Total, &page.MessageTotal); err != nil {
+		return StreamMessagePage{}, err
 	}
 	rows, err := t.db.Query(`SELECT seq,ts,direction,kind,event,event_id,retry,size,payload,payload_blob,truncated
-FROM stream_messages WHERE exchange_id=? ORDER BY seq LIMIT ? OFFSET ?`, exchangeID, limit, offset)
+FROM stream_messages WHERE exchange_id=?`+cond+` ORDER BY seq LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
-		return nil, 0, err
+		return StreamMessagePage{}, err
 	}
 	defer rows.Close()
-	out := []StreamMessage{}
+	page.Items = []StreamMessage{}
 	for rows.Next() {
 		var m StreamMessage
 		var payload []byte
 		var blob sql.NullString
 		var truncated int
 		if err := rows.Scan(&m.Seq, &m.TS, &m.Direction, &m.Kind, &m.Event, &m.EventID, &m.Retry, &m.Size, &payload, &blob, &truncated); err != nil {
-			return nil, 0, err
+			return StreamMessagePage{}, err
 		}
 		m.Truncated = truncated != 0
 		m.Blob = blob.String
@@ -578,9 +628,9 @@ FROM stream_messages WHERE exchange_id=? ORDER BY seq LIMIT ? OFFSET ?`, exchang
 		} else {
 			m.Payload = truncateUTF8(payload, streamPreview)
 		}
-		out = append(out, m)
+		page.Items = append(page.Items, m)
 	}
-	return out, total, rows.Err()
+	return page, rows.Err()
 }
 
 // StreamInfo reports how many stream messages an exchange holds and whether it

@@ -3,6 +3,7 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { t } from "@/i18n";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
@@ -22,6 +23,8 @@ import type {
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
+  ChatBridge,
+  ChatBridgeIdentity,
   CommandRecord,
   Company,
   CompanyScopeMutation,
@@ -82,6 +85,12 @@ import type {
   SSProject,
   SSTask,
   Stats,
+  TamperDryRunRequest,
+  TamperDryRunResult,
+  TamperHook,
+  TamperHookInput,
+  TamperHooksListResp,
+  TamperHookVersion,
   Task,
   TaskArchive,
   TaskArchivePage,
@@ -101,10 +110,13 @@ import type {
   TrafficDetail,
   TrafficEvidenceRef,
   TrafficEvidenceRole,
+  TrafficHARExportMeta,
+  TrafficHARImportResult,
   TrafficHost,
   TrafficReplayRequest,
   TrafficReplayResult,
   TrafficResp,
+  TrafficStreamDirection,
   TrafficStreamPage,
   UsageStats,
   WorkspaceFile,
@@ -148,7 +160,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       document.cookie = "artex_token=; path=/; max-age=0";
       window.location.href = "/login";
     }
-    throw new Error("Unauthorized");
+    throw new Error(t("Unauthorized"));
   }
   if (!r.ok) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
@@ -249,6 +261,7 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
+  if (q.company) p.set("company", q.company);
   return p;
 }
 
@@ -262,7 +275,15 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
 
 export const api = {
   // Backend application version (injected via ldflags at release, default "dev").
-  health: () => get<{ ok: boolean; service: string; version: string; latest_version?: string }>("/health"),
+  // isolation: result of the startup agent isolation self-test; "degraded" shows a banner on every page.
+  health: () =>
+    get<{
+      ok: boolean;
+      service: string;
+      version: string;
+      latest_version?: string;
+      isolation?: { mode: "isolated" | "degraded"; reason?: string };
+    }>("/health"),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
@@ -273,8 +294,11 @@ export const api = {
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
   // ---- tasks ----
-  tasks: () =>
-    get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
+  tasks: (companyId: number | null = null) =>
+    get<{ tasks: Task[]; active: string }>(`/tasks${companyId ? `?company=${companyId}` : ""}`).then((r) => ({
+      tasks: arr(r.tasks),
+      active: r.active ?? "",
+    })),
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
   createTask: (input: {
     name?: string;
@@ -490,7 +514,7 @@ export const api = {
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
-    if (!r.ok) throw new Error(`Upload failed: ${r.status}`);
+    if (!r.ok) throw new Error(t("Upload failed: {error}", { error: r.status }));
     return r.json() as Promise<{ uploaded: number }>;
   },
   workspaceDownload: async (path: string) => {
@@ -502,7 +526,7 @@ export const api = {
       const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
-      if (!r.ok) throw new Error(`Download failed: ${r.status}`);
+      if (!r.ok) throw new Error(t("Download failed: {error}", { error: r.status }));
       blob = await r.blob();
     }
     const objUrl = URL.createObjectURL(blob);
@@ -517,13 +541,13 @@ export const api = {
 
   // ---- assets ----
   // Server-side paginated: pass limit/offset, get back the page + full match total.
-  assets: (type = "", limit = 50, offset = 0) =>
-    get<{ count: number; total: number; assets: Asset[] }>(`/assets?type=${type}&limit=${limit}&offset=${offset}`).then(
-      (r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 }),
-    ),
-  searchAssets: (dsl: string, type = "", limit = 50, offset = 0) =>
+  assets: (type = "", limit = 50, offset = 0, companyId: number | null = null) =>
     get<{ count: number; total: number; assets: Asset[] }>(
-      `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
+      `/assets?type=${type}&limit=${limit}&offset=${offset}${companyId ? `&company_id=${companyId}` : ""}`,
+    ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
+  searchAssets: (dsl: string, type = "", limit = 50, offset = 0, companyId: number | null = null) =>
+    get<{ count: number; total: number; assets: Asset[] }>(
+      `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}${companyId ? `&company_id=${companyId}` : ""}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
@@ -580,7 +604,13 @@ export const api = {
 
   // ---- exploration (per task) ----
   frontier: (task?: string) => get<TaskNode[]>(`/exploration/frontier${tq(task)}`).then(arr),
-  findings: (task?: string) => get<Finding[]>(`/exploration/findings${tq(task)}`).then(arr),
+  findings: (task?: string, company?: string) => {
+    const p = new URLSearchParams();
+    if (task) p.set("task", task);
+    if (company) p.set("company", company);
+    const qs = p.toString();
+    return get<Finding[]>(`/exploration/findings${qs ? `?${qs}` : ""}`).then(arr);
+  },
   findingsPage: (q: FindingQuery) => {
     const p = findingFilterParams(q);
     p.set("page", String(q.page));
@@ -597,7 +627,8 @@ export const api = {
   // findings and their ancestors, nodes carrying subtree aggregate counts. Not paginated — the tree is a navigation structure, fetched in one go.
   findingAssetTree: (q: Omit<FindingQuery, "page" | "pageSize">) =>
     get<FindingAssetTree>(`/exploration/findings/asset-tree?${findingFilterParams(q).toString()}`),
-  findingStats: () => get<FindingStats>("/exploration/findings/stats"),
+  findingStats: (company?: string) =>
+    get<FindingStats>(`/exploration/findings/stats${company ? `?company=${encodeURIComponent(company)}` : ""}`),
   // exportFindings triggers the findings page export and downloads the file. scope=selected
   // sends ids (a finding_id list); scope=filtered sends the current filters (the FindingQuery filter fields); scope=all ignores filters.
   exportFindings: async (opts: {
@@ -616,7 +647,7 @@ export const api = {
     const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`export: ${r.status}`);
+    if (!r.ok) throw new Error(t("Export failed: {error}", { error: r.status }));
     const blob = await r.blob();
     // Prefer the backend's Content-Disposition for the filename; fall back to a default name.
     const disp = r.headers.get("Content-Disposition") ?? "";
@@ -691,8 +722,8 @@ export const api = {
       { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: "Download failed" }));
-      throw new Error(error.error ?? "Download failed");
+      const error = await response.json().catch(() => ({ error: t("Download failed") }));
+      throw new Error(error.error ?? t("Download failed"));
     }
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
@@ -839,10 +870,12 @@ export const api = {
       body?: string;
       path?: string;
       status?: string;
+      rewritten?: string;
       respMin?: string;
       respMax?: string;
       sort?: string;
       order?: string;
+      company?: number | null;
     } = {},
   ) =>
     get<TrafficResp>(
@@ -853,31 +886,110 @@ export const api = {
         (opts.body ? `&body=${encodeURIComponent(opts.body)}` : "") +
         (opts.path ? `&path=${encodeURIComponent(opts.path)}` : "") +
         (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
+        (opts.rewritten && opts.rewritten !== "all" ? `&rewritten=${encodeURIComponent(opts.rewritten)}` : "") +
         (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
         (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
         (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
-        (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
+        (opts.order ? `&order=${encodeURIComponent(opts.order)}` : "") +
+        (opts.company ? `&company=${opts.company}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
   // One page of a WebSocket/SSE exchange's messages, in order.
-  trafficStream: (id: string, offset = 0, limit = 50) =>
-    get<TrafficStreamPage>(`/traffic/stream?exchange=${encodeURIComponent(id)}&offset=${offset}&limit=${limit}`),
+  trafficStream: (id: string, offset = 0, limit = 50, direction: TrafficStreamDirection = "") =>
+    get<TrafficStreamPage>(
+      `/traffic/stream?exchange=${encodeURIComponent(id)}&offset=${offset}&limit=${limit}${direction ? `&direction=${direction}` : ""}`,
+    ),
   // Raw bytes of one stored blob (a full message payload or an oversized body).
   // The JSON-only `get` cannot carry binary, hence the direct fetch.
   trafficBlob: async (hash: string) => {
-    if (MOCK) throw new Error("Blob download is not available in mock mode");
+    if (MOCK) throw new Error(t("Blob download is not available in mock mode"));
     const token = getToken();
     const r = await fetch(`/api/traffic/blob?hash=${encodeURIComponent(hash)}`, {
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     });
-    if (!r.ok) throw new Error(`Blob download failed: ${r.status}`);
+    if (!r.ok) throw new Error(t("Blob download failed: {error}", { error: r.status }));
     return new Uint8Array(await r.arrayBuffer());
   },
-  // Re-sends an edited request through the proxy. Errors carry the HTTP status
-  // (ApiError): 413 body too large, 502 proxy/upstream, 503 capture off, 504 timeout.
+  // Re-sends an edited request through the proxy (bypasses capture rewrite rules
+  // unless req.apply_rules is true). Errors carry the HTTP status (ApiError):
+  // 413 body too large, 502 proxy/upstream, 503 capture off, 504 timeout.
   trafficReplay: async (req: TrafficReplayRequest) => {
-    if (MOCK) throw new Error("Replay is not available in mock mode");
-    return post<TrafficReplayResult>(`/traffic/replay`, req);
+    if (MOCK) throw new Error(t("Replay is not available in mock mode"));
+    return post<TrafficReplayResult>(`/traffic/replay`, {
+      ...req,
+      apply_rules: Boolean(req.apply_rules),
+    });
+  },
+  // Imports a raw HAR 1.2 JSON document into the traffic store.
+  trafficImportHAR: async (rawJSON: string): Promise<TrafficHARImportResult> => {
+    if (MOCK) throw new Error(t("HAR import is not available in mock mode"));
+    return http<TrafficHARImportResult>(`/traffic/import/har`, {
+      method: "POST",
+      body: rawJSON,
+    });
+  },
+  // Exports filtered traffic as a HAR 1.2 file download and returns truncation metadata.
+  trafficExportHAR: async (
+    opts: {
+      host?: string;
+      method?: string;
+      q?: string;
+      body?: string;
+      path?: string;
+      status?: string;
+      rewritten?: string;
+      respMin?: string;
+      respMax?: string;
+    } = {},
+  ): Promise<TrafficHARExportMeta> => {
+    if (MOCK) throw new Error(t("HAR export is not available in mock mode"));
+    const qs = new URLSearchParams();
+    if (opts.host) qs.set("host", opts.host);
+    if (opts.method && opts.method !== "all") qs.set("method", opts.method);
+    if (opts.q) qs.set("q", opts.q);
+    if (opts.body) qs.set("body", opts.body);
+    if (opts.path) qs.set("path", opts.path);
+    if (opts.status && opts.status !== "all") qs.set("status", opts.status);
+    if (opts.rewritten && opts.rewritten !== "all") qs.set("rewritten", opts.rewritten);
+    if (opts.respMin) qs.set("resp_min", opts.respMin);
+    if (opts.respMax) qs.set("resp_max", opts.respMax);
+    const suffix = qs.toString();
+    const token = getToken();
+    const r = await fetch(`/api/traffic/export/har${suffix ? `?${suffix}` : ""}`, {
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    });
+    if (r.status === 401) {
+      if (typeof window !== "undefined") {
+        localStorage.removeItem("artex_token");
+        document.cookie = "artex_token=; path=/; max-age=0";
+        window.location.href = "/login";
+      }
+      throw new Error(t("Unauthorized"));
+    }
+    if (!r.ok) {
+      let msg = String(r.status);
+      try {
+        const payload = (await r.json()) as { error?: unknown };
+        if (typeof payload.error === "string" && payload.error.trim()) msg = payload.error.trim();
+      } catch {
+        // Keep status fallback.
+      }
+      throw new ApiError(t("HAR export failed: {error}", { error: msg }), r.status);
+    }
+    const blob = await r.blob();
+    const exported = Number(r.headers.get("X-ARTEX-HAR-Exported") ?? "0") || 0;
+    const matched = Number(r.headers.get("X-ARTEX-HAR-Matched") ?? "0") || 0;
+    const truncated = r.headers.get("X-ARTEX-HAR-Truncated") === "true";
+    const truncatedReason = r.headers.get("X-ARTEX-HAR-Truncated-Reason") ?? undefined;
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = "artex-traffic.har";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+    return { exported, matched, truncated, truncatedReason };
   },
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
@@ -885,6 +997,16 @@ export const api = {
   // Purges every exchange and compacts the index; `reclaimed` is the bytes of
   // index handed back to the filesystem. Evidence bound to findings is kept.
   trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
+
+  // ---- capture-proxy constrained Go tampering hooks (P4.2, admin-only) ----
+  trafficHooks: () => get<TamperHooksListResp>(`/traffic/hooks`),
+  createTrafficHook: (body: TamperHookInput) => post<TamperHook>(`/traffic/hooks`, { ...body, enabled: false }),
+  updateTrafficHook: (id: number, body: TamperHookInput) => put<TamperHook>(`/traffic/hooks/${id}`, body),
+  deleteTrafficHook: (id: number) => del<{ deleted: boolean }>(`/traffic/hooks/${id}`),
+  toggleTrafficHook: (id: number, enabled: boolean) => post<TamperHook>(`/traffic/hooks/${id}/toggle`, { enabled }),
+  trafficHookVersions: (id: number) => get<{ versions: TamperHookVersion[] }>(`/traffic/hooks/${id}/versions`),
+  rollbackTrafficHook: (id: number, version: number) => post<TamperHook>(`/traffic/hooks/${id}/rollback`, { version }),
+  dryRunTrafficHook: (body: TamperDryRunRequest) => post<TamperDryRunResult>(`/traffic/hooks/dry-run`, body),
 
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
@@ -941,13 +1063,25 @@ export const api = {
     ).then((r) => ({ ...r, deliveries: arr(r.deliveries) }));
   },
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
+
+  // ---- Inbound chat bridge ----
+  // One bridge per chat app kind. PUT semantics: omitted fields keep their stored value, and a masked
+  // config value sent back as-is keeps the stored secret.
+  chatBridges: () => get<ChatBridge[]>(`/chat-bridges`).then(arr),
+  chatBridgeSave: (
+    kind: string,
+    payload: { enabled?: boolean; config?: Record<string, unknown>; allowed_chats?: string[] },
+  ) => put<ChatBridge>(`/chat-bridges/${encodeURIComponent(kind)}`, payload),
+  // Asks the chat app which bot the stored token belongs to; sends no message.
+  chatBridgeTest: (kind: string) =>
+    post<{ ok: boolean; bot: ChatBridgeIdentity; latency_ms: number }>(`/chat-bridges/${encodeURIComponent(kind)}/test`),
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
     const r = await fetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`report: ${r.status}`);
+    if (!r.ok) throw new Error(t("Report failed: {error}", { error: r.status }));
     return r.text();
   },
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
@@ -962,7 +1096,7 @@ export const api = {
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {
     const totalSize = files.reduce((total, file) => total + file.size, 0);
     if (totalSize > MAX_CHAT_UPLOAD_BYTES) {
-      throw new Error("Files exceed the 512 MiB upload limit (combined size).");
+      throw new Error(t("Files exceed the 512 MiB upload limit (combined size)."));
     }
     if (MOCK)
       return {
@@ -981,7 +1115,7 @@ export const api = {
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
-    if (!r.ok) throw new Error(`Upload failed: ${r.status} ${await r.text()}`);
+    if (!r.ok) throw new Error(t("Upload failed: {error}", { error: `${r.status} ${await r.text()}` }));
     return r.json() as Promise<{ attachments: ChatAttachment[] }>;
   },
   stopChat: (taskId: string) => post<{ status: string }>(`/tasks/${taskId}/chat/stop`, {}),
@@ -1024,6 +1158,8 @@ export const api = {
     streaming = true, // test with the profile's real streaming mode so "streaming works, non-streaming does not" never leaks into conversations
     session_header_key = "", // non-empty = the test request also carries this custom session header (value is a one-off session id)
     user_agent = "", // non-empty = the test overrides the User-Agent header with this value
+    custom_headers = "",
+    max_tokens_field?: string, // ""=max_tokens | "max_completion_tokens"; omitted = the stored profile's choice
   ) =>
     // reply = the model's actual reply (truncated); the backend marks a profile that replies with nothing as failed
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
@@ -1038,6 +1174,8 @@ export const api = {
       streaming,
       session_header_key,
       user_agent,
+      custom_headers,
+      max_tokens_field,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -1051,6 +1189,11 @@ export const api = {
     rate_per_second?: number;
     rate_per_minute?: number;
     context_window_k?: number;
+    // Cost ledger, EUR per 1M tokens; 0 = unset. Sent on every save, which rewrites all four.
+    price_input_per_m?: number;
+    price_output_per_m?: number;
+    price_cache_read_per_m?: number;
+    price_cache_write_per_m?: number;
     thinking_type?: string; // ""(not sent)|"disabled"|"enabled"
     reasoning_effort?: string; // ""(not sent)|"low"|"medium"|"high"|"xhigh"|"max"
     priority?: number; // pool order position; higher is used first
@@ -1060,6 +1203,8 @@ export const api = {
     max_tokens_field?: string; // ""=max_tokens (default) | "max_completion_tokens" (openai format only)
     session_header_key?: string; // non-empty = send this HTTP header on every request, value = the current session id; "" = not sent
     user_agent?: string; // non-empty = override the User-Agent header on every request; "" = keep the default UA
+    custom_headers?: string; // static Bedrock gateway headers; values are write-only
+    clear_custom_headers?: boolean;
     retry?: LLMRetryOverride; // this profile's retry override; all zeros = follow the global retry policy
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
@@ -1245,7 +1390,7 @@ export const api = {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body?.error || `Upload failed (${r.status})`);
+    if (!r.ok) throw new Error(body?.error || t("Upload failed ({status})", { status: r.status }));
     return body;
   },
   deleteSkill: (name: string) => del<{ deleted: string }>(`/skills/${name}`),

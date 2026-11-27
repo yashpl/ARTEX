@@ -56,34 +56,12 @@ import { useSideQuestions } from "@/hooks/use-side-questions";
 import { mergeActivities } from "@/lib/activity-merge";
 import { api } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
-import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
+import { formatBytes, formatTokens } from "@/lib/format";
+import { getLocalStorageValue, removeLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { isBtwCommand } from "@/lib/side-questions";
 import type { Activity, Agent, ChatAttachment, Conversation, LLMProfile } from "@/lib/types";
 import { cn } from "@/lib/utils";
-
-// fmtBytes renders a human file size for attachment chips (mirrors transcript.tsx).
-function fmtBytes(n: number): string {
-  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
-  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KB`;
-  return `${n} B`;
-}
-
-// fmtTokens renders a compact token count (1234 → 1.2k, 2_000_000 → 2M).
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
-  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
-  return String(n);
-}
-
-// fmtDuration renders an elapsed milliseconds span compactly (90s → 1m30s).
-function fmtDuration(ms: number): string {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h${String(m % 60).padStart(2, "0")}m`;
-}
+import { intlLocale, t } from "@/i18n";
 
 // HISTORY_PAGE is how many steps one history page loads: the latest page on open,
 // then one more page each time the user scrolls to the top. Kept modest so a long
@@ -95,6 +73,10 @@ const CONVERSATION_LIST_PAGE = 100;
 // rail looks the same after a reload; unknown keys are harmless (a deleted agent
 // simply never renders a group again).
 const COLLAPSED_AGENTS_KEY = "artex.chat.collapsed-agents";
+// The conversation that was open when the user last left the chat page. The
+// sidebar links to a bare /chat, so without this, coming back from another page
+// always lands on the empty draft view. A ?c= in the URL takes precedence.
+const LAST_CONVERSATION_KEY = "artex.chat.last-conversation";
 
 function conversationIsPinned(conversation: Conversation): boolean {
   return conversation.pinned ?? Boolean(conversation.pinned_at);
@@ -137,7 +119,7 @@ function LiveBadge() {
   return (
     <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
       <span className="size-1 animate-pulse rounded-full bg-blue-500" />
-      Live
+      {t("Live")}
     </span>
   );
 }
@@ -197,13 +179,13 @@ function Composer({
             >
               <PaperclipIcon className="size-3 shrink-0 text-primary" />
               <span className="max-w-[160px] truncate">{a.name}</span>
-              <span className="text-muted-foreground">{fmtBytes(a.size)}</span>
+              <span className="text-muted-foreground">{formatBytes(a.size)}</span>
               {onRemoveAttachment && (
                 <button
                   type="button"
                   className="ml-0.5 text-muted-foreground hover:text-foreground"
                   onClick={() => onRemoveAttachment(a.path)}
-                  title="Remove"
+                  title={t("Remove")}
                 >
                   <XIcon className="size-3" />
                 </button>
@@ -234,7 +216,7 @@ function Composer({
               variant="ghost"
               onClick={() => fileInputRef.current?.click()}
               disabled={disabled || uploading}
-              title="Upload files"
+              title={t("Upload files")}
             >
               {uploading ? <Loader2Icon className="size-4 animate-spin" /> : <PaperclipIcon className="size-4" />}
             </Button>
@@ -250,14 +232,14 @@ function Composer({
           onKeyDown={onKeyDown}
         />
         {running && allowBtw && isBtwCommand(value) && (
-          <Button size="icon" onClick={onSend} aria-label="Send side question" title="Send side question">
+          <Button size="icon" onClick={onSend} aria-label={t("Send side question")} title={t("Send side question")}>
             <ArrowUpIcon />
           </Button>
         )}
         {running ? (
           // while a run is in flight the send button becomes a stop button —
           // aborts just this session (the trigger queue keeps going).
-          <Button size="icon" variant="destructive" onClick={onStop} disabled={stopDisabled} title="Stop this run">
+          <Button size="icon" variant="destructive" onClick={onStop} disabled={stopDisabled} title={t("Stop this run")}>
             <Square className="size-3.5 fill-current" />
           </Button>
         ) : (
@@ -265,8 +247,8 @@ function Composer({
             size="icon"
             onClick={onSend}
             disabled={disabled || (!value.trim() && atts.length === 0)}
-            title="Send message"
-            aria-label="Send message"
+            title={t("Send message")}
+            aria-label={t("Send message")}
           >
             <ArrowUpIcon />
           </Button>
@@ -294,7 +276,11 @@ function LLMProfileRow({
   const [open, setOpen] = React.useState(false);
   const activeDefault = profiles.find((p) => p.is_default);
   const current = selected != null ? profiles.find((p) => Number(p.id) === selected) : null;
-  const label = current ? current.name : `Default${activeDefault ? ` (${activeDefault.name})` : ""}`;
+  const label = current
+    ? current.name
+    : activeDefault
+      ? t("Default ({name})", { name: activeDefault.name })
+      : t("Default");
 
   return (
     <div className="flex min-w-0 shrink-0 items-center gap-1 px-1 pt-0.5 pb-1">
@@ -309,12 +295,12 @@ function LLMProfileRow({
             disabled={disabled}
             className="flex shrink-0 items-center gap-0.5 text-primary text-xs hover:underline disabled:pointer-events-none disabled:opacity-40"
           >
-            Change
+            {t("Change")}
             <ChevronDownIcon className="size-3" />
           </button>
         </PopoverTrigger>
         <PopoverContent align="start" className="w-64 p-1">
-          <p className="text-muted-foreground px-2 py-1 text-[11px] font-medium">Select an LLM profile</p>
+          <p className="text-muted-foreground px-2 py-1 text-[11px] font-medium">{t("Select an LLM profile")}</p>
           {/* default option */}
           <button
             type="button"
@@ -327,7 +313,9 @@ function LLMProfileRow({
               selected == null && "bg-accent",
             )}
           >
-            <span className="text-sm">Default{activeDefault ? ` (${activeDefault.name})` : ""}</span>
+            <span className="text-sm">
+              {activeDefault ? t("Default ({name})", { name: activeDefault.name }) : t("Default")}
+            </span>
             {activeDefault && (
               <span className="text-muted-foreground text-[11px]">
                 {activeDefault.format} · {activeDefault.model}
@@ -395,7 +383,7 @@ function DraftChat({
       await api.sendConversationMessage(c.id, msg);
       onStarted(c);
     } catch (e) {
-      toast.error("Send failed: " + (e as Error).message);
+      toast.error(t("Send failed: {error}", { error: (e as Error).message }));
       setSending(false);
     }
   }
@@ -413,7 +401,7 @@ function DraftChat({
       const r = await api.chatUpload("session", `conv-${c.id}`, files);
       onStarted(c, { input, attachments: r.attachments });
     } catch (e) {
-      toast.error("Upload failed: " + (e as Error).message);
+      toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
       setUploading(false);
     }
   }
@@ -421,7 +409,7 @@ function DraftChat({
   const agentPicker = (
     <Select value={agentKey} onValueChange={setAgentKey}>
       <SelectTrigger className="w-full sm:w-40">
-        <SelectValue placeholder="Select an agent…" />
+        <SelectValue placeholder={t("Select an agent…")} />
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
@@ -432,7 +420,7 @@ function DraftChat({
                 {a.name}
                 {!a.builtin && (
                   <Badge variant="outline" className="px-1 py-0 text-[9px]">
-                    Custom
+                    {t("Custom")}
                   </Badge>
                 )}
               </span>
@@ -450,7 +438,9 @@ function DraftChat({
         <div className="bg-primary/10 flex size-12 items-center justify-center rounded-full">
           <Bot className="text-primary size-6" />
         </div>
-        <div className="text-sm font-medium">Start a conversation with "{agent?.name ?? "Agent"}"</div>
+        <div className="text-sm font-medium">
+          {t('Start a conversation with "{name}"', { name: agent?.name ?? t("Agent") })}
+        </div>
         {agent?.description && <p className="text-muted-foreground max-w-md text-xs">{agent.description}</p>}
       </div>
 
@@ -459,7 +449,7 @@ function DraftChat({
         onChange={setInput}
         onSend={send}
         disabled={sending || uploading || !agentKey}
-        placeholder="Type a message, @ to reference records, Enter to send"
+        placeholder={t("Type a message, @ to reference records, Enter to send")}
         leftSlot={agentPicker}
         onPickFiles={pickFiles}
         uploading={uploading}
@@ -518,7 +508,7 @@ function ChatView({
       await api.updateConversationProfile(conv.id, id);
       onConvUpdated();
     } catch (e) {
-      toast.error("Failed to switch LLM: " + (e as Error).message);
+      toast.error(t("Failed to switch LLM: {error}", { error: (e as Error).message }));
     }
   }
 
@@ -716,7 +706,7 @@ function ChatView({
       const r = await api.chatUpload("session", `conv-${conv.id}`, files);
       setAttachments((prev) => [...prev, ...r.attachments]);
     } catch (e) {
-      toast.error("Upload failed: " + (e as Error).message);
+      toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
     } finally {
       setUploading(false);
     }
@@ -736,7 +726,7 @@ function ChatView({
       // fetch avoids racing a separate post-send request against the poller.
       setRunning(true);
     } catch (e) {
-      toast.error("Send failed: " + (e as Error).message);
+      toast.error(t("Send failed: {error}", { error: (e as Error).message }));
       setInput(msg); // restore so the user doesn't lose their text
       setAttachments(atts); // and their attachments
     } finally {
@@ -753,7 +743,7 @@ function ChatView({
     try {
       await api.stopConversation(conv.id);
     } catch (e) {
-      toast.error("Stop failed: " + (e as Error).message);
+      toast.error(t("Stop failed: {error}", { error: (e as Error).message }));
     } finally {
       setStopping(false);
     }
@@ -768,7 +758,7 @@ function ChatView({
         <span className="text-muted-foreground hidden shrink-0 font-mono text-xs sm:inline">{conv.agent_key}</span>
         {agent && !agent.builtin && (
           <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">
-            Custom
+            {t("Custom")}
           </Badge>
         )}
         {agent?.description && (
@@ -778,13 +768,17 @@ function ChatView({
         <SideQuestionButton side={side} />
         <div className="text-muted-foreground ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs max-sm:w-full max-sm:flex-wrap">
           {tokenTotal.turns > 0 && (
-            <span title="Agent loop turns (model calls)" className="tabular-nums">
-              {tokenTotal.turns} turns
+            <span title={t("Agent loop turns (model calls)")} className="tabular-nums">
+              {t("{count} turns", { count: tokenTotal.turns })}
             </span>
           )}
           {tokenTotal.any && (
-            <span title="input / cache(read) / output tokens" className="min-w-0 truncate tabular-nums">
-              input {fmtTokens(tokenTotal.i)} · cache {fmtTokens(tokenTotal.cr)} · output {fmtTokens(tokenTotal.o)}
+            <span title={t("input / cache(read) / output tokens")} className="min-w-0 truncate tabular-nums">
+              {t("input {input} · cache {cache} · output {output}", {
+                input: formatTokens(tokenTotal.i),
+                cache: formatTokens(tokenTotal.cr),
+                output: formatTokens(tokenTotal.o),
+              })}
             </span>
           )}
         </div>
@@ -797,12 +791,12 @@ function ChatView({
         <div className="min-w-0 max-w-full px-4 py-3" ref={contentRef}>
           {messages.length === 0 && !running ? (
             <div className="text-muted-foreground py-10 text-center text-sm">
-              Start a conversation with "{agent?.name ?? conv.agent_key}"
+              {t('Start a conversation with "{name}"', { name: agent?.name ?? conv.agent_key })}
             </div>
           ) : (
             <>
               {hasMore && (
-                <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">Scroll up to load earlier messages…</div>
+                <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">{t("Scroll up to load earlier messages…")}</div>
               )}
               <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} />
             </>
@@ -816,7 +810,11 @@ function ChatView({
         onSend={send}
         disabled={running || sending}
         allowBtw
-        placeholder={running ? "Agent is replying; type /btw to ask a side question…" : "Type a message, @ to reference records, Enter to send"}
+        placeholder={
+          running
+            ? t("Agent is replying; type /btw to ask a side question…")
+            : t("Type a message, @ to reference records, Enter to send")
+        }
         running={running}
         onStop={stop}
         stopDisabled={stopping}
@@ -897,7 +895,7 @@ const ConversationItem = React.memo(function ConversationItem({
         <Checkbox
           checked={selectedForDelete}
           onCheckedChange={(checked) => onSelectedForDeleteChange(conv.id, checked === true)}
-          aria-label={`Select conversation "${conv.title || "New conversation"}"`}
+          aria-label={t('Select conversation "{title}"', { title: conv.title || t("New conversation") })}
           className="ml-1 shrink-0"
         />
       )}
@@ -924,16 +922,16 @@ const ConversationItem = React.memo(function ConversationItem({
           type="button"
           onClick={() => onSelect(conv.id)}
           onDoubleClick={() => onStartRename(conv)}
-          title="Double-click to rename"
+          title={t("Double-click to rename")}
           className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left"
         >
           <div className="flex min-w-0 items-center gap-1.5">
-            {pinned && <PinIcon className="text-primary size-3 shrink-0" aria-label="Pinned" />}
-            <div className="truncate text-sm">{conv.title || "New conversation"}</div>
+            {pinned && <PinIcon className="text-primary size-3 shrink-0" aria-label={t("Pinned")} />}
+            <div className="truncate text-sm">{conv.title || t("New conversation")}</div>
             {conv.running ? (
-              <Badge variant="secondary" className="shrink-0 gap-1" title="Agent is running">
+              <Badge variant="secondary" className="shrink-0 gap-1" title={t("Agent is running")}>
                 <Spinner className="size-3" aria-hidden="true" />
-                Running
+                {t("Running")}
               </Badge>
             ) : null}
           </div>
@@ -946,7 +944,7 @@ const ConversationItem = React.memo(function ConversationItem({
               </>
             )}
             <span className="shrink-0">
-              {new Date(conv.created_at).toLocaleDateString("zh-CN", {
+              {new Date(conv.created_at).toLocaleDateString(intlLocale, {
                 month: "numeric",
                 day: "numeric",
                 hour: "2-digit",
@@ -963,7 +961,7 @@ const ConversationItem = React.memo(function ConversationItem({
             variant="ghost"
             size="icon-sm"
             className="text-muted-foreground shrink-0"
-            aria-label={`Manage conversation "${conv.title || "New conversation"}"`}
+            aria-label={t('Manage conversation "{title}"', { title: conv.title || t("New conversation") })}
           >
             <MoreHorizontalIcon />
           </Button>
@@ -972,18 +970,18 @@ const ConversationItem = React.memo(function ConversationItem({
           <DropdownMenuGroup>
             <DropdownMenuItem onSelect={() => onStartRename(conv)}>
               <PencilIcon />
-              Rename
+              {t("Rename")}
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => onTogglePinned(conv)}>
               {pinned ? <PinOffIcon /> : <PinIcon />}
-              {pinned ? "Unpin" : "Pin"}
+              {pinned ? t("Unpin") : t("Pin")}
             </DropdownMenuItem>
           </DropdownMenuGroup>
           <DropdownMenuSeparator />
           <DropdownMenuGroup>
             <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
               <Trash2Icon />
-              Delete
+              {t("Delete")}
             </DropdownMenuItem>
           </DropdownMenuGroup>
         </DropdownMenuContent>
@@ -991,12 +989,14 @@ const ConversationItem = React.memo(function ConversationItem({
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete conversation "{conv.title || "New conversation"}"?</AlertDialogTitle>
-            <AlertDialogDescription>This action cannot be undone.</AlertDialogDescription>
+            <AlertDialogTitle>
+              {t('Delete conversation "{title}"?', { title: conv.title || t("New conversation") })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>{t("This action cannot be undone.")}</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => onDelete(conv.id)}>Delete</AlertDialogAction>
+            <AlertDialogCancel>{t("Cancel")}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => onDelete(conv.id)}>{t("Delete")}</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -1022,7 +1022,7 @@ function AgentGroupHeader({
       type="button"
       onClick={() => onToggle(group.key)}
       aria-expanded={!collapsed}
-      title={collapsed ? `Expand "${group.name}"` : `Collapse "${group.name}"`}
+      title={collapsed ? t('Expand "{name}"', { name: group.name }) : t('Collapse "{name}"', { name: group.name })}
       className={cn(
         "sticky top-0 z-10 flex min-w-0 items-center gap-1.5 rounded-md bg-card px-1.5 py-1 text-left font-medium text-[11px] transition-colors hover:bg-accent/50",
         collapsed && hasActive ? "text-foreground" : "text-muted-foreground",
@@ -1032,10 +1032,10 @@ function AgentGroupHeader({
       <Bot className="size-3 shrink-0" />
       <span className="min-w-0 flex-1 truncate">{group.name}</span>
       {collapsed && hasActive && (
-        <span className="size-1.5 shrink-0 rounded-full bg-primary" title="The current conversation is in this group" />
+        <span className="size-1.5 shrink-0 rounded-full bg-primary" title={t("The current conversation is in this group")} />
       )}
       {group.runningCount > 0 && (
-        <Spinner className="size-3 shrink-0" aria-label={`${group.runningCount} conversations running`} />
+        <Spinner className="size-3 shrink-0" aria-label={t("{count} conversations running", { count: group.runningCount })} />
       )}
       <span className="shrink-0 tabular-nums opacity-60">{group.conversations.length}</span>
     </button>
@@ -1152,13 +1152,14 @@ export default function ChatPage() {
     });
   }, []);
 
-  // Restore the open conversation from the URL (?c=<id>) on mount, so a refresh
-  // returns to the same thread instead of the empty draft view. Runs after
+  // Restore the open conversation on mount, so a refresh or a return from another
+  // page lands on the same thread instead of the empty draft view: the URL
+  // (?c=<id>) first, else the last conversation opened here. Runs after
   // hydration (not a lazy useState init) to avoid a server/client mismatch.
   React.useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setSourceRequested(params.has("approval"));
-    const c = params.get("c");
+    const c = params.get("c") ?? getLocalStorageValue(LAST_CONVERSATION_KEY);
     const id = c ? Number(c) : NaN;
     if (Number.isFinite(id)) setSelectedId(id);
   }, []);
@@ -1166,10 +1167,19 @@ export default function ChatPage() {
   // selectedId with no matching conversation (e.g. a stale ?c=, or a just-created
   // one before reloadConvs lands) simply renders the draft view — harmless — so we
   // deliberately do NOT auto-clear it here (that raced new-conversation creation).
+  // The same value goes to localStorage for the restore above. On mount this
+  // effect runs once with the initial null before the restored id lands; the
+  // restore has already read the stored value by then and writes it back on the
+  // next render.
   React.useEffect(() => {
     const url = new URL(window.location.href);
-    if (selectedId != null) url.searchParams.set("c", String(selectedId));
-    else url.searchParams.delete("c");
+    if (selectedId != null) {
+      url.searchParams.set("c", String(selectedId));
+      setLocalStorageValue(LAST_CONVERSATION_KEY, String(selectedId));
+    } else {
+      url.searchParams.delete("c");
+      removeLocalStorageValue(LAST_CONVERSATION_KEY);
+    }
     window.history.replaceState(null, "", url);
   }, [selectedId]);
 
@@ -1211,10 +1221,10 @@ export default function ChatPage() {
     if (agentFilter !== null) keys.add(agentFilter);
     return [...keys]
       .map((key) => ({ key, name: agentByKey.get(key)?.name || key, count: counts.get(key) ?? 0 }))
-      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+      .sort((a, b) => a.name.localeCompare(b.name, intlLocale));
   }, [convs, chatAgents, agentByKey, agentFilter]);
   const conversationCountLabel =
-    agentFilter === null ? `${convs.length} total` : `${filteredConversations.length} / ${convs.length}`;
+    agentFilter === null ? t("{count} total", { count: convs.length }) : `${filteredConversations.length} / ${convs.length}`;
 
   function changeAgentFilter(key: string | null) {
     setAgentFilter(key);
@@ -1265,7 +1275,7 @@ export default function ChatPage() {
         });
         void reloadConvs();
       } catch (e) {
-        toast.error("Delete failed: " + (e as Error).message);
+        toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
       }
     },
     [reloadConvs],
@@ -1282,7 +1292,7 @@ export default function ChatPage() {
         const result = await api.deleteConversations(ids.slice(offset, offset + 100));
         for (const item of result.items) {
           if (item.ok) deleted.add(item.id);
-          else failed.push({ id: item.id, error: item.error ?? "conversation not found" });
+          else failed.push({ id: item.id, error: item.error ?? t("conversation not found") });
         }
       }
       if (deleted.has(selectedId ?? -1)) selectConversation(null);
@@ -1291,13 +1301,18 @@ export default function ChatPage() {
         for (const id of deleted) next.delete(id);
         return next;
       });
-      if (deleted.size > 0) toast.success(`Deleted ${deleted.size} conversations`);
+      if (deleted.size > 0) toast.success(t("Deleted {count} conversations", { count: deleted.size }));
       if (failed.length > 0) {
         const details = failed
           .slice(0, 3)
           .map((item) => `#${item.id} (${item.error})`)
           .join("; ");
-        toast.error(`Failed to delete ${failed.length} conversations: ${details}${failed.length > 3 ? " etc." : ""}`);
+        toast.error(
+          t("Failed to delete {count} conversations: {details}", {
+            count: failed.length,
+            details: failed.length > 3 ? t("{items} etc.", { items: details }) : details,
+          }),
+        );
       }
       setBulkDeleteOpen(false);
       // Fully successful → return to the clean list; keep selection mode on if
@@ -1305,7 +1320,7 @@ export default function ChatPage() {
       if (failed.length === 0) setSelectionMode(false);
       void reloadConvs();
     } catch (error) {
-      toast.error(`Bulk delete failed: ${(error as Error).message}`);
+      toast.error(t("Bulk delete failed: {error}", { error: (error as Error).message }));
       void reloadConvs();
     } finally {
       setBulkDeleting(false);
@@ -1319,7 +1334,8 @@ export default function ChatPage() {
         await api.pinConversation(conversation.id, !pinned);
         void reloadConvs();
       } catch (e) {
-        toast.error(`Failed to ${pinned ? "unpin" : "pin"}: ${(e as Error).message}`);
+        const error = (e as Error).message;
+        toast.error(pinned ? t("Failed to unpin: {error}", { error }) : t("Failed to pin: {error}", { error }));
       }
     },
     [reloadConvs],
@@ -1338,7 +1354,7 @@ export default function ChatPage() {
         await api.renameConversation(id, title);
         void reloadConvs();
       } catch (e) {
-        toast.error("Rename failed: " + (e as Error).message);
+        toast.error(t("Rename failed: {error}", { error: (e as Error).message }));
       }
     },
     [reloadConvs],
@@ -1355,20 +1371,20 @@ export default function ChatPage() {
         <div className="bg-card flex flex-col overflow-hidden rounded-lg border">
           <div className="flex flex-col gap-2 border-b p-2">
             <Button size="sm" className="w-full" onClick={() => selectConversation(null)}>
-              <PlusIcon /> New conversation
+              <PlusIcon /> {t("New conversation")}
             </Button>
             <Select
               value={agentFilter === null ? "all" : `agent:${agentFilter}`}
               onValueChange={(value) => changeAgentFilter(value === "all" ? null : value.slice(6))}
               disabled={bulkDeleting}
             >
-              <SelectTrigger size="sm" className="w-full min-w-0" aria-label="Filter conversations by agent">
+              <SelectTrigger size="sm" className="w-full min-w-0" aria-label={t("Filter conversations by agent")}>
                 <Bot />
-                <SelectValue placeholder="All agents" />
+                <SelectValue placeholder={t("All agents")} />
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value="all">All agents</SelectItem>
+                  <SelectItem value="all">{t("All agents")}</SelectItem>
                   {agentFilterOptions.map((agent) => (
                     <SelectItem key={agent.key} value={`agent:${agent.key}`}>
                       {agent.name} ({agent.count})
@@ -1383,11 +1399,13 @@ export default function ChatPage() {
                   <Checkbox
                     checked={conversationHeaderChecked}
                     onCheckedChange={(checked) => toggleAllConversations(checked === true)}
-                    aria-label="Select all conversations matching the current filter"
+                    aria-label={t("Select all conversations matching the current filter")}
                     disabled={filteredConversations.length === 0 || bulkDeleting}
                   />
                   <span className="text-muted-foreground min-w-0 flex-1 text-xs tabular-nums">
-                    {selectedConversationCount > 0 ? `${selectedConversationCount} selected` : conversationCountLabel}
+                    {selectedConversationCount > 0
+                      ? t("{count} selected", { count: selectedConversationCount })
+                      : conversationCountLabel}
                   </span>
                   {selectedConversationCount > 0 && (
                     <Button
@@ -1397,11 +1415,11 @@ export default function ChatPage() {
                       onClick={() => setBulkDeleteOpen(true)}
                     >
                       <Trash2Icon data-icon="inline-start" />
-                      Delete
+                      {t("Delete")}
                     </Button>
                   )}
                   <Button size="sm" variant="ghost" onClick={exitSelectionMode}>
-                    Done
+                    {t("Done")}
                   </Button>
                 </div>
               ) : (
@@ -1417,7 +1435,7 @@ export default function ChatPage() {
                     disabled={filteredConversations.length === 0}
                   >
                     <ListChecksIcon data-icon="inline-start" />
-                    Select
+                    {t("Select")}
                   </Button>
                 </div>
               ))}
@@ -1430,7 +1448,7 @@ export default function ChatPage() {
             <div className="flex min-w-0 flex-col gap-0.5 p-2">
               {filteredConversations.length === 0 && (
                 <p className="text-muted-foreground px-2 py-6 text-center text-xs">
-                  {agentFilter === null ? "No conversations yet" : "No conversations for this agent"}
+                  {agentFilter === null ? t("No conversations yet") : t("No conversations for this agent")}
                 </p>
               )}
               {pinnedConversations.map((c) => (
@@ -1496,7 +1514,7 @@ export default function ChatPage() {
                   className="mt-1 w-full"
                   onClick={() => setVisibleConversationCount((count) => count + CONVERSATION_LIST_PAGE)}
                 >
-                  Load more
+                  {t("Load more")}
                 </Button>
               )}
             </div>
@@ -1517,7 +1535,7 @@ export default function ChatPage() {
             />
           ) : sourceRequested ? (
             <div role="status" className="p-6 text-sm text-muted-foreground">
-              {convsLoaded ? "The conversation has been deleted" : "Loading the conversation…"}
+              {convsLoaded ? t("The conversation has been deleted") : t("Loading the conversation…")}
             </div>
           ) : (
             <DraftChat
@@ -1545,11 +1563,15 @@ export default function ChatPage() {
       <AlertDialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete {selectedConversationCount} selected conversations?</AlertDialogTitle>
-            <AlertDialogDescription>Conversation messages and execution records will be deleted with them. This action cannot be undone.</AlertDialogDescription>
+            <AlertDialogTitle>
+              {t("Delete {count} selected conversations?", { count: selectedConversationCount })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("Conversation messages and execution records will be deleted with them. This action cannot be undone.")}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={bulkDeleting}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={bulkDeleting}>{t("Cancel")}</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               disabled={bulkDeleting || selectedConversationCount === 0}
@@ -1559,7 +1581,7 @@ export default function ChatPage() {
               }}
             >
               {bulkDeleting && <Loader2Icon data-icon="inline-start" className="animate-spin" />}
-              {bulkDeleting ? "Deleting" : "Confirm delete"}
+              {bulkDeleting ? t("Deleting") : t("Confirm delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

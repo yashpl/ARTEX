@@ -41,6 +41,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { api } from "@/lib/api";
+import { formatShortDateTime } from "@/lib/format";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { statusMeta } from "@/lib/status";
 import type {
@@ -55,6 +56,7 @@ import type {
   VerificationStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useActiveCompany } from "@/stores/company/company-store";
 
 import { AssetTree, assetPathOf } from "./_components/asset-tree";
 import {
@@ -64,7 +66,6 @@ import {
   type FindingReport,
   FindingsTable,
   findingRowKey,
-  fmtTime,
   isSameFinding,
   REPORT_STATE_META,
   SEVERITIES,
@@ -73,6 +74,7 @@ import {
   VERIFICATION_STATUSES,
 } from "./_components/findings-table";
 import { setVisibleInterval } from "@/lib/polling";
+import { t } from "@/i18n";
 
 const FINDING_LIST_PREFERENCE_KEY = "artex_finding_list_preferences";
 
@@ -140,6 +142,10 @@ const EMPTY_STATS: FindingStats = {
 };
 
 export default function FindingsPage() {
+  // The sidebar's company switcher narrows everything below on the server: the
+  // flat and grouped lists, the asset tree and the stat cards all send `company`.
+  // Undefined means all companies.
+  const company = useActiveCompany();
   const [view, setView] = React.useState<FindingView>("flat");
   const [severity, setSeverity] = React.useState<"all" | Severity>("all");
   const [status, setStatus] = React.useState<"all" | FindingStatus>("all");
@@ -184,6 +190,7 @@ export default function FindingsPage() {
     task,
     sort,
     query,
+    company,
   ]);
   const activeFilterFingerprint = React.useRef(filterFingerprint);
   activeFilterFingerprint.current = filterFingerprint;
@@ -201,7 +208,8 @@ export default function FindingsPage() {
         setActiveRetests(Object.fromEntries(rows.map((item) => [item.finding_id, item])));
         failed = false;
       } catch (error) {
-        if (!disposed && !failed) toast.error(`Failed to load retest status: ${(error as Error).message}`);
+        if (!disposed && !failed)
+          toast.error(t("Failed to load retest status: {error}", { error: (error as Error).message }));
         failed = true;
       } finally {
         if (!disposed) timer = setTimeout(() => void refreshRetests(), 3000);
@@ -320,13 +328,24 @@ export default function FindingsPage() {
       await api.exportFindings({
         format: exportFormat,
         scope: exportScope,
-        filters: { severity, status, reportState, verificationStatus, vulnclass, task, query, sort },
+        filters: {
+          severity,
+          status,
+          reportState,
+          verificationStatus,
+          vulnclass,
+          task,
+          query,
+          sort,
+          assetScope: activeAssetScope ?? undefined,
+          company,
+        },
         ids: [...selectedIds],
       });
       setExportOpen(false);
-      toast.success("Export download started");
+      toast.success(t("Export download started"));
     } catch (e) {
-      toast.error(`Export failed: ${(e as Error).message}`);
+      toast.error(t("Export failed: {error}", { error: (e as Error).message }));
     } finally {
       setExporting(false);
     }
@@ -344,6 +363,14 @@ export default function FindingsPage() {
   expandedGroupsRef.current = expandedGroups;
   groupFindingsRef.current = groupFindings;
   visibleGroupKeysRef.current = new Set(groups.map(findingGroupKey));
+
+  // A company switch drops the picked asset node: the node may belong to the
+  // company we just left, and the tree is about to be reloaded under the new one.
+  React.useEffect(() => {
+    // company is a trigger here, not a value the effect reads.
+    void company;
+    setAssetScope(null);
+  }, [company]);
 
   // The asset view's right-hand list = the flat list + a filter for the selected subtree, so both views share one list state.
   const activeAssetScope = view === "asset" ? assetScope : null;
@@ -367,6 +394,7 @@ export default function FindingsPage() {
         query,
         sort,
         assetScope: activeAssetScope ?? undefined,
+        company,
       });
       if (request !== flatRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setFlat({ items: result.items, total: result.total, loaded: true, loading: false });
@@ -377,6 +405,7 @@ export default function FindingsPage() {
     }
   }, [
     activeAssetScope,
+    company,
     filterFingerprint,
     flatPage,
     flatPageSize,
@@ -391,7 +420,7 @@ export default function FindingsPage() {
   ]);
 
   // loadAssetTree fetches the whole asset tree. The tree doesn't change with the selected node (otherwise
-  // picking one would collapse it into a single chain), so no assetScope here.
+  // picking one would collapse it into a single chain), so no picked node here — only the active company.
   const loadAssetTree = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
     if (activeFilterFingerprint.current !== requestFilter) return;
@@ -407,6 +436,7 @@ export default function FindingsPage() {
         task,
         query,
         sort,
+        company,
       });
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree({
@@ -420,9 +450,20 @@ export default function FindingsPage() {
     } catch (e) {
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree((current) => ({ ...current, loading: false }));
-      toast.error(`Failed to load the asset tree: ${(e as Error).message}`);
+      toast.error(t("Failed to load the asset tree: {error}", { error: (e as Error).message }));
     }
-  }, [filterFingerprint, reportState, severity, status, verificationStatus, vulnclass, task, query, sort]);
+  }, [
+    company,
+    filterFingerprint,
+    reportState,
+    severity,
+    status,
+    verificationStatus,
+    vulnclass,
+    task,
+    query,
+    sort,
+  ]);
 
   const refreshGroups = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
@@ -440,6 +481,7 @@ export default function FindingsPage() {
         task,
         query,
         sort,
+        company,
       });
       if (request !== groupsRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setGroups(result.items);
@@ -448,7 +490,20 @@ export default function FindingsPage() {
     } catch {
       // Polling keeps the last successful snapshot visible.
     }
-  }, [filterFingerprint, page, pageSize, reportState, severity, status, verificationStatus, vulnclass, task, query, sort]);
+  }, [
+    company,
+    filterFingerprint,
+    page,
+    pageSize,
+    reportState,
+    severity,
+    status,
+    verificationStatus,
+    vulnclass,
+    task,
+    query,
+    sort,
+  ]);
 
   const loadGroup = React.useCallback(
     async (key: string, groupPage: number, groupPageSize: number) => {
@@ -479,6 +534,7 @@ export default function FindingsPage() {
           task: key,
           query,
           sort,
+          company,
         });
         if (groupRequests.current[key] !== request || activeFilterFingerprint.current !== requestFilter) return;
         setGroupFindings((current) => ({
@@ -509,7 +565,7 @@ export default function FindingsPage() {
         }));
       }
     },
-    [filterFingerprint, reportState, severity, status, verificationStatus, vulnclass, query, sort],
+    [company, filterFingerprint, reportState, severity, status, verificationStatus, vulnclass, query, sort],
   );
 
   React.useEffect(() => {
@@ -630,7 +686,7 @@ export default function FindingsPage() {
     let alive = true;
     const load = () => {
       api
-        .findingStats()
+        .findingStats(company)
         .then((s) => {
           if (alive) {
             setStats(s);
@@ -647,7 +703,7 @@ export default function FindingsPage() {
       alive = false;
       stopPolling();
     };
-  }, []);
+  }, [company]);
 
   React.useEffect(() => {
     if (!statsLoaded) return;
@@ -669,10 +725,10 @@ export default function FindingsPage() {
       setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, status: next } : x)));
       try {
         await api.setFindingStatus(f.finding_id, next);
-        toast.success(`Marked as "${statusMeta("finding", next).label}"`);
+        toast.success(t('Marked as "{label}"', { label: statusMeta("finding", next).label }));
         // refresh stat cards (pending count) and drop the row if it no longer matches the status filter
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The row update remains valid even if the aggregate refresh fails.
@@ -685,10 +741,10 @@ export default function FindingsPage() {
         refreshAfterMutation(f);
       } catch (e) {
         setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, status: prev } : x)));
-        toast.error(`Update failed: ${(e as Error).message}`);
+        toast.error(t("Update failed: {error}", { error: (e as Error).message }));
       }
     },
-    [refreshAfterMutation, setFindings, status],
+    [refreshAfterMutation, setFindings, status, company],
   );
 
   const updateReportState = React.useCallback(
@@ -698,9 +754,9 @@ export default function FindingsPage() {
       setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, report_state: next } : x)));
       try {
         await api.setFindingReportState(f.finding_id, next);
-        toast.success(`Report stage set to "${REPORT_STATE_META[next].label}"`);
+        toast.success(t('Report stage set to "{label}"', { label: REPORT_STATE_META[next].label }));
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The row update remains valid even if the aggregate refresh fails.
@@ -713,10 +769,10 @@ export default function FindingsPage() {
         refreshAfterMutation(f);
       } catch (e) {
         setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, report_state: prev } : x)));
-        toast.error(`Update failed: ${(e as Error).message}`);
+        toast.error(t("Update failed: {error}", { error: (e as Error).message }));
       }
     },
-    [refreshAfterMutation, reportState, setFindings],
+    [refreshAfterMutation, reportState, setFindings, company],
   );
 
   // applyBulkStatus sets the same triage status on every selected finding, then
@@ -729,24 +785,22 @@ export default function FindingsPage() {
         const r = await api.bulkSetFindingStatus([...selectedIds], next);
         setSelectedIds(new Set());
         const label = statusMeta("finding", next).label;
-        toast.success(
-          r.updated === 1 ? `Marked 1 finding as "${label}"` : `Marked ${r.updated} findings as "${label}"`,
-        );
+        toast.success(t('Marked {count} findings as "{label}"', { count: r.updated, label }));
         void loadFlat();
         if (view === "asset") void loadAssetTree();
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The list reload remains valid even if the aggregate refresh fails.
           });
       } catch (e) {
-        toast.error(`Bulk update failed: ${(e as Error).message}`);
+        toast.error(t("Bulk update failed: {error}", { error: (e as Error).message }));
       } finally {
         setBulkBusy(false);
       }
     },
-    [bulkBusy, loadAssetTree, loadFlat, selectedIds, view],
+    [bulkBusy, loadAssetTree, loadFlat, selectedIds, view, company],
   );
 
   const applyBulkReportState = React.useCallback(
@@ -757,26 +811,22 @@ export default function FindingsPage() {
         const r = await api.bulkSetFindingReportState([...selectedIds], next);
         setSelectedIds(new Set());
         const label = REPORT_STATE_META[next].label;
-        toast.success(
-          r.updated === 1
-            ? `Set report stage of 1 finding to "${label}"`
-            : `Set report stage of ${r.updated} findings to "${label}"`,
-        );
+        toast.success(t('Set report stage of {count} findings to "{label}"', { count: r.updated, label }));
         void loadFlat();
         if (view === "asset") void loadAssetTree();
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The list reload remains valid even if the aggregate refresh fails.
           });
       } catch (e) {
-        toast.error(`Bulk update failed: ${(e as Error).message}`);
+        toast.error(t("Bulk update failed: {error}", { error: (e as Error).message }));
       } finally {
         setBulkBusy(false);
       }
     },
-    [bulkBusy, loadAssetTree, loadFlat, selectedIds, view],
+    [bulkBusy, loadAssetTree, loadFlat, selectedIds, view, company],
   );
 
   // The inline expanded detailed-report cache is keyed by the globally stable row key. report is long-form
@@ -828,21 +878,21 @@ export default function FindingsPage() {
               : x,
           ),
         );
-        toast.success("Saved");
+        toast.success(t("Saved"));
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The edit remains valid even if the aggregate refresh fails.
           });
         refreshAfterMutation(f);
       } catch (e) {
-        toast.error(`Save failed: ${(e as Error).message}`);
+        toast.error(t("Save failed: {error}", { error: (e as Error).message }));
       } finally {
         setSaving(false);
       }
     },
-    [edit, refreshAfterMutation, setFindings],
+    [edit, refreshAfterMutation, setFindings, company],
   );
 
   // deleteFinding deletes one vulnerability (with confirmation): on success it removes it from the list, collapses the row, and refreshes stats.
@@ -861,19 +911,19 @@ export default function FindingsPage() {
         setFlat((cur) => ({ ...cur, total: Math.max(0, cur.total - 1) }));
         const rowKey = findingRowKey(f);
         setExpanded((cur) => (cur === rowKey ? null : cur));
-        toast.success("Vulnerability deleted");
+        toast.success(t("Vulnerability deleted"));
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The deletion remains valid even if the aggregate refresh fails.
           });
         refreshAfterMutation(f, true);
       } catch (e) {
-        toast.error(`Delete failed: ${(e as Error).message}`);
+        toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
       }
     },
-    [refreshAfterMutation, setFindings],
+    [refreshAfterMutation, setFindings, company],
   );
 
   const openDeepen = React.useCallback((f: Finding) => {
@@ -888,28 +938,28 @@ export default function FindingsPage() {
       const result = await api.deepenFinding(deepenFinding.finding_id, deepenDescription.trim());
       toast.success(
         result.queued
-          ? `Deepen intent #${result.intent_id} has entered the task queue`
-          : `Created high-priority worker intent #${result.intent_id}`,
+          ? t("Deepen intent #{id} has entered the task queue", { id: result.intent_id })
+          : t("Created high-priority worker intent #{id}", { id: result.intent_id }),
       );
       refreshAfterMutation(deepenFinding);
       setDeepenFinding(null);
       setDeepenDescription("");
     } catch (error) {
-      toast.error(`Submit failed: ${(error as Error).message}`);
+      toast.error(t("Submit failed: {error}", { error: (error as Error).message }));
     } finally {
       setDeepening(false);
     }
   }
 
   const statCards = [
-    { label: "Total findings", value: stats.total, icon: BugIcon },
-    { label: "Pending", value: stats.pending, tone: "text-amber-500", icon: ClockIcon },
-    { label: "Submitted", value: stats.submitted, tone: "text-amber-500", icon: FileUpIcon },
-    { label: "Accepted", value: stats.accepted, tone: "text-emerald-500", icon: CircleCheckIcon },
-    { label: "Critical", value: stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon },
-    { label: "High", value: stats.high, tone: "text-red-500", icon: TriangleAlertIcon },
-    { label: "Medium", value: stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon },
-    { label: "Low", value: stats.low, tone: "text-slate-500", icon: InfoIcon },
+    { label: t("Total findings"), value: stats.total, icon: BugIcon },
+    { label: t("Pending"), value: stats.pending, tone: "text-amber-500", icon: ClockIcon },
+    { label: t("Submitted"), value: stats.submitted, tone: "text-amber-500", icon: FileUpIcon },
+    { label: t("Accepted"), value: stats.accepted, tone: "text-emerald-500", icon: CircleCheckIcon },
+    { label: t("Critical"), value: stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon },
+    { label: t("High"), value: stats.high, tone: "text-red-500", icon: TriangleAlertIcon },
+    { label: t("Medium"), value: stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon },
+    { label: t("Low"), value: stats.low, tone: "text-slate-500", icon: InfoIcon },
   ];
 
   // The "current filter" count in the export dialog: both views share the same filters, only the counting source differs.
@@ -949,7 +999,7 @@ export default function FindingsPage() {
           </div>
         ) : (
           <>
-            <FindingsTable items={flat.items} selectAllLabel="Select all on this page" {...rowProps} />
+            <FindingsTable items={flat.items} selectAllLabel={t("Select all on this page")} {...rowProps} />
             <TablePagination
               page={flatPage}
               pageSize={flatPageSize}
@@ -971,14 +1021,14 @@ export default function FindingsPage() {
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Findings</h1>
-          <p className="text-muted-foreground text-sm">Cross-task vulnerability overview</p>
+          <h1 className="text-xl font-semibold tracking-tight">{t("Findings")}</h1>
+          <p className="text-muted-foreground text-sm">{t("Cross-task vulnerability overview")}</p>
         </div>
         <Tabs value={view} onValueChange={(v) => setView(v as FindingView)}>
           <TabsList>
-            <TabsTrigger value="flat">All findings</TabsTrigger>
-            <TabsTrigger value="grouped">By task</TabsTrigger>
-            <TabsTrigger value="asset">By asset</TabsTrigger>
+            <TabsTrigger value="flat">{t("All findings")}</TabsTrigger>
+            <TabsTrigger value="grouped">{t("By task")}</TabsTrigger>
+            <TabsTrigger value="asset">{t("By asset")}</TabsTrigger>
           </TabsList>
         </Tabs>
       </div>
@@ -1006,8 +1056,8 @@ export default function FindingsPage() {
               type="search"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search findings"
-              aria-label="Search findings"
+              placeholder={t("Search findings")}
+              aria-label={t("Search findings")}
             />
             <InputGroupAddon>
               <SearchIcon aria-hidden="true" />
@@ -1024,14 +1074,14 @@ export default function FindingsPage() {
           >
             {(
               [
-                ["all", "All"],
-                ["critical", "Critical"],
-                ["high", "High"],
-                ["medium", "Medium"],
-                ["low", "Low"],
+                ["all", t("All")],
+                ["critical", t("Critical")],
+                ["high", t("High")],
+                ["medium", t("Medium")],
+                ["low", t("Low")],
               ] as const
             ).map(([val, label]) => (
-              <ToggleGroupItem key={val} value={val} aria-label={`Filter by ${label} severity`}>
+              <ToggleGroupItem key={val} value={val} aria-label={t("Filter by {label} severity", { label })}>
                 {label}
               </ToggleGroupItem>
             ))}
@@ -1039,10 +1089,10 @@ export default function FindingsPage() {
 
           <Select value={status} onValueChange={(v) => setStatus(v as "all" | FindingStatus)}>
             <SelectTrigger size="sm" className="w-32">
-              <SelectValue placeholder="Status" />
+              <SelectValue placeholder={t("Status")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All statuses</SelectItem>
+              <SelectItem value="all">{t("All statuses")}</SelectItem>
               {FINDING_STATUSES.map((st) => (
                 <SelectItem key={st} value={st}>
                   {statusMeta("finding", st).label}
@@ -1053,10 +1103,10 @@ export default function FindingsPage() {
 
           <Select value={reportState} onValueChange={(v) => setReportState(v as "all" | FindingReportState)}>
             <SelectTrigger size="sm" className="w-40">
-              <SelectValue placeholder="Report stage" />
+              <SelectValue placeholder={t("Report stage")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All report stages</SelectItem>
+              <SelectItem value="all">{t("All report stages")}</SelectItem>
               {FINDING_REPORT_STATES.map((st) => (
                 <SelectItem key={st} value={st}>
                   {REPORT_STATE_META[st].label}
@@ -1070,10 +1120,10 @@ export default function FindingsPage() {
             onValueChange={(v) => setVerificationStatus(v as "all" | VerificationStatus)}
           >
             <SelectTrigger size="sm" className="w-48">
-              <SelectValue placeholder="Verification" />
+              <SelectValue placeholder={t("Verification")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All verification states</SelectItem>
+              <SelectItem value="all">{t("All verification states")}</SelectItem>
               {VERIFICATION_STATUSES.map((st) => (
                 <SelectItem key={st} value={st}>
                   {VERIFICATION_META[st].label}
@@ -1084,10 +1134,10 @@ export default function FindingsPage() {
 
           <Select value={vulnclass} onValueChange={setVulnclass}>
             <SelectTrigger size="sm" className="w-40">
-              <SelectValue placeholder="Vulnerability type" />
+              <SelectValue placeholder={t("Vulnerability type")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All types</SelectItem>
+              <SelectItem value="all">{t("All types")}</SelectItem>
               {stats.vulnclasses.map((vc) => (
                 <SelectItem key={vc} value={vc}>
                   {vc}
@@ -1098,14 +1148,14 @@ export default function FindingsPage() {
 
           <Select value={task} onValueChange={setTask}>
             <SelectTrigger size="sm" className="w-48">
-              <SelectValue placeholder="Task" />
+              <SelectValue placeholder={t("Task")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All tasks</SelectItem>
-              <SelectItem value={UNASSIGNED_TASK}>Unlinked / task deleted</SelectItem>
-              {(stats.tasks ?? []).map((t) => {
-                const id = String(t.id);
-                const label = t.name || t.description || `Task #${id} (deleted)`;
+              <SelectItem value="all">{t("All tasks")}</SelectItem>
+              <SelectItem value={UNASSIGNED_TASK}>{t("Unlinked / task deleted")}</SelectItem>
+              {(stats.tasks ?? []).map((option) => {
+                const id = String(option.id);
+                const label = option.name || option.description || t("Task #{id} (deleted)", { id });
                 return (
                   <SelectItem key={id} value={id}>
                     <span className="flex w-full items-center gap-2">
@@ -1114,7 +1164,7 @@ export default function FindingsPage() {
                       </span>
                       <span className="inline-flex items-center gap-1 text-muted-foreground tabular-nums">
                         <BugIcon className="size-3.5" aria-hidden="true" />
-                        {t.count}
+                        {option.count}
                       </span>
                     </span>
                   </SelectItem>
@@ -1128,15 +1178,17 @@ export default function FindingsPage() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="severity">By severity</SelectItem>
-              <SelectItem value="time">By time</SelectItem>
+              <SelectItem value="severity">{t("By severity")}</SelectItem>
+              <SelectItem value="time">{t("By time")}</SelectItem>
             </SelectContent>
           </Select>
 
           <div className="ml-auto flex items-center gap-3">
             {selectedIds.size > 0 && (
               <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground tabular-nums">{selectedIds.size} selected</span>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  {t("{count} selected", { count: selectedIds.size })}
+                </span>
                 <Select
                   value=""
                   onValueChange={(v) => {
@@ -1144,8 +1196,8 @@ export default function FindingsPage() {
                   }}
                   disabled={bulkBusy}
                 >
-                  <SelectTrigger size="sm" className="w-40" aria-label="Set the status of the selected findings">
-                    <SelectValue placeholder={bulkBusy ? "Updating…" : "Set status"} />
+                  <SelectTrigger size="sm" className="w-40" aria-label={t("Set the status of the selected findings")}>
+                    <SelectValue placeholder={bulkBusy ? t("Updating…") : t("Set status")} />
                   </SelectTrigger>
                   <SelectContent>
                     {FINDING_STATUSES.map((st) => (
@@ -1162,8 +1214,12 @@ export default function FindingsPage() {
                   }}
                   disabled={bulkBusy}
                 >
-                  <SelectTrigger size="sm" className="w-44" aria-label="Set the report stage of the selected findings">
-                    <SelectValue placeholder={bulkBusy ? "Updating…" : "Set report stage"} />
+                  <SelectTrigger
+                    size="sm"
+                    className="w-44"
+                    aria-label={t("Set the report stage of the selected findings")}
+                  >
+                    <SelectValue placeholder={bulkBusy ? t("Updating…") : t("Set report stage")} />
                   </SelectTrigger>
                   <SelectContent>
                     {FINDING_REPORT_STATES.map((st) => (
@@ -1176,7 +1232,7 @@ export default function FindingsPage() {
               </div>
             )}
             <Button size="sm" variant="outline" onClick={openExport}>
-              <DownloadIcon /> Export
+              <DownloadIcon /> {t("Export")}
             </Button>
           </div>
         </div>
@@ -1212,7 +1268,7 @@ export default function FindingsPage() {
                   className={cn("hover:text-foreground", assetScope === null && "font-medium text-foreground")}
                   onClick={() => setAssetScope(null)}
                 >
-                  All assets
+                  {t("All assets")}
                 </button>
                 {assetPath.map((node) => (
                   <React.Fragment key={node.key}>
@@ -1230,7 +1286,9 @@ export default function FindingsPage() {
                     </button>
                   </React.Fragment>
                 ))}
-                <span className="ml-auto shrink-0 text-xs tabular-nums">{flat.total} in total</span>
+                <span className="ml-auto shrink-0 text-xs tabular-nums">
+                  {t("{count} in total", { count: flat.total })}
+                </span>
               </div>
               {flatListCard}
             </div>
@@ -1269,13 +1327,13 @@ export default function FindingsPage() {
                         <div className="flex min-w-0 flex-col gap-1">
                           <CardTitle className="truncate text-sm">
                             {group.task_id === null
-                              ? "Unlinked / task deleted"
+                              ? t("Unlinked / task deleted")
                               : group.task_name
-                                ? `${group.task_name} (task #${group.task_id})`
-                                : `Task #${group.task_id}`}
+                                ? t("{name} (task #{id})", { name: group.task_name, id: group.task_id })
+                                : t("Task #{id}", { id: group.task_id })}
                           </CardTitle>
                           <CardDescription className="truncate" title={group.task_description}>
-                            {group.task_description || "Source task unavailable"}
+                            {group.task_description || t("Source task unavailable")}
                           </CardDescription>
                         </div>
                       </button>
@@ -1292,13 +1350,13 @@ export default function FindingsPage() {
                           );
                         })}
                         <span className="text-xs tabular-nums text-muted-foreground">
-                          {fmtTime(group.last_found_at)}
+                          {formatShortDateTime(group.last_found_at, { seconds: false })}
                         </span>
                         {group.task_id !== null && (
                           <Button size="icon-sm" variant="ghost" asChild>
                             <Link
                               href={`/function/tasks/detail?id=${group.task_id}`}
-                              aria-label={`View task #${group.task_id}`}
+                              aria-label={t("View task #{id}", { id: group.task_id })}
                             >
                               <ArrowUpRightIcon />
                             </Link>
@@ -1315,7 +1373,11 @@ export default function FindingsPage() {
                         </div>
                       ) : (
                         <>
-                          <FindingsTable items={state.items} selectAllLabel="Select all on this page in this group" {...rowProps} />
+                          <FindingsTable
+                            items={state.items}
+                            selectAllLabel={t("Select all on this page in this group")}
+                            {...rowProps}
+                          />
                           <TablePagination
                             page={state.page}
                             pageSize={state.pageSize}
@@ -1332,7 +1394,9 @@ export default function FindingsPage() {
             })}
             {groups.length === 0 && (
               <Card>
-                <CardContent className="py-12 text-center text-sm text-muted-foreground">No matching findings.</CardContent>
+                <CardContent className="py-12 text-center text-sm text-muted-foreground">
+                  {t("No matching findings.")}
+                </CardContent>
               </Card>
             )}
             <TablePagination
@@ -1381,25 +1445,30 @@ export default function FindingsPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Deepen exploitation</DialogTitle>
+            <DialogTitle>{t("Deepen exploitation")}</DialogTitle>
             <DialogDescription className="break-words">
-              A priority-10 worker intent will be created in the original task #{deepenFinding?.task_id} to run secondary verification based on this vulnerability:
+              {t(
+                "A priority-10 worker intent will be created in the original task #{id} to run secondary verification based on this vulnerability:",
+                { id: deepenFinding?.task_id ?? "" },
+              )}{" "}
               {deepenFinding?.name || deepenFinding?.vulnclass || deepenFinding?.summary}
             </DialogDescription>
           </DialogHeader>
           <FieldGroup>
             <Field>
-              <FieldLabel htmlFor="finding-deepen-description">Exploitation description</FieldLabel>
+              <FieldLabel htmlFor="finding-deepen-description">{t("Exploitation description")}</FieldLabel>
               <Textarea
                 id="finding-deepen-description"
                 value={deepenDescription}
                 onChange={(event) => setDeepenDescription(event.target.value)}
                 maxLength={4000}
-                placeholder="Describe the exploitation path to verify, boundary conditions, targets, or expected evidence"
+                placeholder={t(
+                  "Describe the exploitation path to verify, boundary conditions, targets, or expected evidence",
+                )}
                 disabled={deepening}
               />
               <FieldDescription className="flex justify-between gap-3">
-                <span>The new intent inherits this vulnerability's asset anchors.</span>
+                <span>{t("The new intent inherits this vulnerability's asset anchors.")}</span>
                 <span className="shrink-0 tabular-nums">{deepenDescription.length} / 4000</span>
               </FieldDescription>
             </Field>
@@ -1413,11 +1482,11 @@ export default function FindingsPage() {
               }}
               disabled={deepening}
             >
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button onClick={submitDeepen} disabled={deepening || !deepenDescription.trim()}>
               {deepening && <Spinner data-icon="inline-start" />}
-              Create deepen intent
+              {t("Create deepen intent")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1426,42 +1495,46 @@ export default function FindingsPage() {
       <Dialog open={exportOpen} onOpenChange={setExportOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Export findings</DialogTitle>
-            <DialogDescription>Choose the export scope and format; the browser downloads the file automatically once generated.</DialogDescription>
+            <DialogTitle>{t("Export findings")}</DialogTitle>
+            <DialogDescription>
+              {t("Choose the export scope and format; the browser downloads the file automatically once generated.")}
+            </DialogDescription>
           </DialogHeader>
 
           <div className="flex flex-col gap-5 py-1">
             <div className="flex flex-col gap-2">
-              <span className="text-xs text-muted-foreground">Export scope</span>
+              <span className="text-xs text-muted-foreground">{t("Export scope")}</span>
               <RadioGroup value={exportScope} onValueChange={(v) => setExportScope(v as typeof exportScope)}>
                 <label htmlFor="export-scope-filtered" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-scope-filtered" value="filtered" /> Export the current filter results ({filteredTotal}{" "}
-                  items)
+                  <RadioGroupItem id="export-scope-filtered" value="filtered" />{" "}
+                  {t("Export the current filter results ({count} items)", { count: filteredTotal })}
                 </label>
                 <label htmlFor="export-scope-all" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-scope-all" value="all" /> Export all
+                  <RadioGroupItem id="export-scope-all" value="all" /> {t("Export all")}
                 </label>
                 <label
                   htmlFor="export-scope-selected"
                   className={cn("flex items-center gap-2 text-sm", selectedIds.size === 0 && "text-muted-foreground")}
                 >
                   <RadioGroupItem id="export-scope-selected" value="selected" disabled={selectedIds.size === 0} />
-                  Export the {selectedIds.size} selected items
+                  {t("Export the {count} selected items", { count: selectedIds.size })}
                 </label>
               </RadioGroup>
             </div>
 
             <div className="flex flex-col gap-2">
-              <span className="text-xs text-muted-foreground">Export format</span>
+              <span className="text-xs text-muted-foreground">{t("Export format")}</span>
               <RadioGroup value={exportFormat} onValueChange={(v) => setExportFormat(v as typeof exportFormat)}>
                 <label htmlFor="export-format-md-single" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-md-single" value="md-single" /> Markdown summary report (a single .md file)
+                  <RadioGroupItem id="export-format-md-single" value="md-single" />{" "}
+                  {t("Markdown summary report (a single .md file)")}
                 </label>
                 <label htmlFor="export-format-md-zip" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-md-zip" value="md-zip" /> Markdown per finding (one .md per vulnerability, packaged as .zip)
+                  <RadioGroupItem id="export-format-md-zip" value="md-zip" />{" "}
+                  {t("Markdown per finding (one .md per vulnerability, packaged as .zip)")}
                 </label>
                 <label htmlFor="export-format-csv" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-csv" value="csv" /> CSV table (.csv)
+                  <RadioGroupItem id="export-format-csv" value="csv" /> {t("CSV table (.csv)")}
                 </label>
                 <label htmlFor="export-format-json" className="flex items-center gap-2 text-sm">
                   <RadioGroupItem id="export-format-json" value="json" /> JSON (.json)
@@ -1472,10 +1545,10 @@ export default function FindingsPage() {
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setExportOpen(false)} disabled={exporting}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button onClick={doExport} disabled={exporting || (exportScope === "selected" && selectedIds.size === 0)}>
-              <DownloadIcon /> {exporting ? "Exporting…" : "Export"}
+              <DownloadIcon /> {exporting ? t("Exporting…") : t("Export")}
             </Button>
           </DialogFooter>
         </DialogContent>

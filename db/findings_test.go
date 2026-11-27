@@ -35,7 +35,7 @@ func TestValidFindingReportState(t *testing.T) {
 func TestDeleteFinding(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -81,7 +81,7 @@ func TestDeleteFinding(t *testing.T) {
 func TestSetFindingStatusMirrorsNodePayload(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -100,6 +100,7 @@ func TestSetFindingStatusMirrorsNodePayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer d.DeleteFinding(fid)
 
 	n, err := d.SetFindingStatus(fid, FindingFalsePositive)
 	if err != nil || n != 1 {
@@ -144,15 +145,15 @@ func TestSetFindingStatusMirrorsNodePayload(t *testing.T) {
 func TestFindingReportState(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { d.Close() })
 
 	tk, err := d.CreateTask("finding report state", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
+	t.Cleanup(func() { _ = d.DeleteTask(tk.ID) })
 
 	es := d.Exploration(tk.ExplorationID)
 	nodeID, err := es.AddNode(KindFinding, map[string]any{"summary": "x", "severity": "high"}, 5, "confirmed", "worker", nil)
@@ -167,7 +168,11 @@ func TestFindingReportState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id IN ($1,$2)`, fid, second) })
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM notification_events WHERE finding_id IN ($1,$2)`, fid, second)
+		_, _ = d.DeleteFinding(fid)
+		_, _ = d.DeleteFinding(second)
+	})
 
 	one, err := d.GetFinding(fid)
 	if err != nil || one == nil || one.ReportState != FindingReportNone {
@@ -256,7 +261,7 @@ func TestFindingReportState(t *testing.T) {
 func TestFindingsPageAndStats(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -414,7 +419,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -462,7 +467,7 @@ func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -606,7 +611,7 @@ func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 func TestAddFindingFollowUpIntent(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -633,6 +638,7 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer d.DeleteFinding(findingID)
 
 	auditInput := Activity{Worker: "system", Kind: "text", Summary: "Manually submitted vulnerability deep-exploitation intent", Detail: "Verify exploitability and build an evidence chain"}
 	intentID, audit, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "Verify exploitability and build an evidence chain", auditInput)
