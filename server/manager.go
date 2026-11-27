@@ -300,6 +300,13 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+
+	// workers caches settings.workers so hot worker loops can check for
+	// scale-down without hitting PostgreSQL on every tick (0 = uninitialized).
+	workers atomic.Int64
+	// onWorkersChange is wired by NewEngine so SetWorkers dynamically scales
+	// running tasks without requiring a restart (guarded by m.mu).
+	onWorkersChange func(int)
 }
 
 // Settings keys the UI toggles at runtime.
@@ -382,26 +389,57 @@ func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 	return m.pg.SetSetting(settingConcurrencyOn, strconv.FormatBool(enabled))
 }
 
-// Workers returns the configured concurrent work-agent count (default 3). Read
-// per-task at engine.Run, so a change applies to tasks started afterwards.
+// SetWorkersChangeHook registers a callback invoked after SetWorkers persists a
+// new concurrent work-agent count (wired by NewEngine to scale running tasks).
+func (m *Manager) SetWorkersChangeHook(fn func(int)) {
+	m.mu.Lock()
+	m.onWorkersChange = fn
+	m.mu.Unlock()
+}
+
+// Workers returns the configured concurrent work-agent count (default 3).
+// Cached in memory after the first read or SetWorkers call so running worker
+// loops can check it without querying PostgreSQL on every iteration.
 func (m *Manager) Workers() int {
+	if n := int(m.workers.Load()); n > 0 {
+		return n
+	}
+	if m.pg == nil {
+		return defaultWorkers
+	}
 	v, ok, err := m.pg.GetSetting(settingWorkers)
 	if err != nil || !ok {
+		m.workers.Store(defaultWorkers)
 		return defaultWorkers
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil || n <= 0 {
+		m.workers.Store(defaultWorkers)
 		return defaultWorkers
 	}
+	m.workers.Store(int64(n))
 	return n
 }
 
-// SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
+// SetWorkers persists the concurrent work-agent count and dynamically
+// reconciles running tasks via the registered hook. Values <=0 are rejected.
 func (m *Manager) SetWorkers(n int) error {
 	if n <= 0 {
 		return fmt.Errorf("workers must be >0")
 	}
-	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
+	if m.pg != nil {
+		if err := m.pg.SetSetting(settingWorkers, strconv.Itoa(n)); err != nil {
+			return err
+		}
+	}
+	m.workers.Store(int64(n))
+	m.mu.RLock()
+	hook := m.onWorkersChange
+	m.mu.RUnlock()
+	if hook != nil {
+		hook(n)
+	}
+	return nil
 }
 
 // Enrich returns the asset auto-completion engine (may be nil if init failed).

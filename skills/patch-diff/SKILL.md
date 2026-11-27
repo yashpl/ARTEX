@@ -19,6 +19,11 @@ Attribution: adapted from the `patch-diff-exploit` playbook of [zhaoxuya520/reve
 
 If the environment lacks a tool a step needs (see Environment notes), report the gap and stop. Never simulate diff output or fabricate crash evidence.
 
+## Context Hygiene (Local-LLM First)
+
+- Save `ghidriff` markdown reports, symbol lists, and disassembly dumps (`>4 KB`) to files in the current intent workdir and inspect only functions in the `0.5–0.95` similarity band using `grep`/`head` — never paste full binary-diff reports into context.
+- Cite verified `cwe` / `attack` IDs via `knowledge_lookup` when recording root-cause facts or reporting findings.
+
 ## When to use
 
 1. **Known CVE, no public PoC.** The advisory names the component and bug class but ships only the fix.

@@ -600,6 +600,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedFactSourceSchema()          // source enum on record_fact, added once per DB
 	s.refreshRecordFactContract()     // record_fact publishes the facts-only contract (one-time)
 	s.seedTaskScopeDescription()      // add_task_scope: "coverage scope, not enforced" replaces the authorization-boundary text
+	s.seedBuiltinTaskTemplates()      // seeds built-in task categories and pentest task templates (one-time)
 	// Note: pentest's default tool bindings need no migration — BuiltinToolSeeds already seeds
 	// list_assets/insert_assets/report_finding/list_findings/list_companies together with
 	// pentest at fresh initialization (no old DBs exist in this project, so no migration).

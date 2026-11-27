@@ -13,6 +13,11 @@ Never report findings in, and never trace through: test code, build and packagin
 
 **Exception**: security-relevant infrastructure configuration checked into the repository IS in scope when it affects the application's security assumptions (reverse proxy and nginx directives, trust proxy settings, header forwarding, TLS termination, CORS policy). A directive that promotes a normally trusted value to attacker-controllable is a deployed vulnerability, not an operational note.
 
+## Context Hygiene & Taxonomy (Local-LLM First)
+
+- **File-first navigation**: never dump whole large source files (`>200` lines), minified bundles, or unfiltered `grep`/`rg` results into context. Cap search output (`| head -30`), read only targeted `file:line` windows around entry points, guards, and sinks, and persist the input inventory and sweep table as files in the intent workdir.
+- **Taxonomy mapping**: use `knowledge_lookup` with `cwe`, `wstg`, or `owasp-api` to cite stable weakness IDs in `record_fact` and `report_finding`.
+
 ## Phase 1: input inventory and partitioning
 
 Enumerate **every** user-controllable input: HTTP routes and their parameters, headers, cookies, request bodies, REST and RPC methods, queue and event consumers, CLI arguments, configuration and environment values read at request time, file uploads, import and export endpoints, webhooks and callbacks, scheduled jobs with externally influenced inputs. For each entry point record the handler file:line.

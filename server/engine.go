@@ -117,9 +117,11 @@ type Engine struct {
 	// Every long-lived task goroutine (planner, workers and deadline coordinator)
 	// runs under one task-scoped context. Successful deletion cancels that context,
 	// waits for all goroutines, then releases every task-level Engine reference.
-	runtimeMu sync.Mutex
-	draining  bool
-	runtimes  map[string]*taskRuntime
+	runtimeMu      sync.Mutex
+	draining       bool
+	desiredWorkers int // dynamic worker target (0 = not yet initialized; guarded by runtimeMu)
+	workerGen      uint64
+	runtimes       map[string]*taskRuntime
 
 	// per-task execution context: each planner.Plan / worker.Execute runs under it,
 	// so pausing can CANCEL an in-flight run (not just skip the next one). Recreated
@@ -162,9 +164,16 @@ type Engine struct {
 }
 
 type taskRuntime struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	wg     sync.WaitGroup
+	ctx     context.Context
+	cancel  context.CancelCauseFunc
+	wg      sync.WaitGroup
+	task    *Task
+	workers map[int]uint64 // 1-based live worker slot index -> unique generation token (guarded by Engine.runtimeMu)
+}
+
+type workerSlot struct {
+	idx int
+	gen uint64
 }
 
 type workExecution struct {
@@ -454,10 +463,14 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
 func NewEngine(m *Manager) *Engine {
-	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
+	e := &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
 		runtimes: map[string]*taskRuntime{}}
+	if m != nil {
+		m.SetWorkersChangeHook(e.ReconcileWorkers)
+	}
+	return e
 }
 
 // registerWork records the cancel for the work currently running intentID.
@@ -829,11 +842,168 @@ func (e *Engine) ReadyFor(t *Task) bool {
 	return p != nil && w != nil
 }
 
+// initialWorkers reads the configured worker count outside Engine locks so
+// Manager.Workers() can warm its cache from PostgreSQL without holding runtimeMu.
+func (e *Engine) initialWorkers() int {
+	if e.m != nil {
+		if n := e.m.Workers(); n > 0 {
+			return n
+		}
+	}
+	return defaultWorkers
+}
+
+// registerTaskStart atomically reserves the planner, claim-sweep, and initial
+// worker goroutines on the task runtime. Callers must hold deleteMu for reading
+// so StopTask cannot race WaitGroup.Add with Wait.
+func (e *Engine) registerTaskStart(parent context.Context, t *Task, fallbackWorkers int) (*taskRuntime, []workerSlot) {
+	e.runtimeMu.Lock()
+	defer e.runtimeMu.Unlock()
+	if e.draining {
+		return nil, nil
+	}
+	if e.desiredWorkers <= 0 {
+		if fallbackWorkers <= 0 {
+			fallbackWorkers = defaultWorkers
+		}
+		e.desiredWorkers = fallbackWorkers
+	}
+	workers := e.desiredWorkers
+	rt := e.runtimes[t.ID]
+	if rt == nil {
+		ctx, cancel := context.WithCancelCause(parent)
+		rt = &taskRuntime{ctx: ctx, cancel: cancel}
+		e.runtimes[t.ID] = rt
+	}
+	rt.task = t
+	if rt.workers == nil {
+		rt.workers = make(map[int]uint64, workers)
+	}
+	slots := make([]workerSlot, 0, workers)
+	for idx := 1; idx <= workers; idx++ {
+		if _, exists := rt.workers[idx]; !exists {
+			e.workerGen++
+			gen := e.workerGen
+			rt.workers[idx] = gen
+			slots = append(slots, workerSlot{idx: idx, gen: gen})
+		}
+	}
+	rt.wg.Add(2 + len(slots))
+	return rt, slots
+}
+
+// ReconcileWorkers dynamically adjusts the worker pool of every running task to
+// n without restarting the engine or interrupting in-flight intents:
+//   - Scale up: spawns any missing worker slots in 1..n on each running task's
+//     runtime and nudges the planner (t.Notify()) so newly idle workers get work.
+//   - Scale down: updates the target count; excess workers (idx > n) exit cleanly
+//     at the top of workerLoop once idle, before claiming a new intent.
+func (e *Engine) ReconcileWorkers(n int) {
+	if e == nil || n <= 0 {
+		return
+	}
+	type spawnBatch struct {
+		rt    *taskRuntime
+		task  *Task
+		slots []workerSlot
+	}
+	var batches []spawnBatch
+
+	e.deleteMu.RLock()
+	e.runtimeMu.Lock()
+	e.desiredWorkers = n
+	if !e.draining {
+		for taskID, rt := range e.runtimes {
+			if rt == nil || rt.task == nil || rt.ctx == nil || rt.ctx.Err() != nil {
+				continue
+			}
+			if e.IsDeleting(taskID) {
+				continue
+			}
+			if rt.workers == nil {
+				rt.workers = make(map[int]uint64, n)
+			}
+			var missing []workerSlot
+			for idx := 1; idx <= n; idx++ {
+				if _, exists := rt.workers[idx]; !exists {
+					e.workerGen++
+					gen := e.workerGen
+					rt.workers[idx] = gen
+					missing = append(missing, workerSlot{idx: idx, gen: gen})
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			rt.wg.Add(len(missing))
+			batches = append(batches, spawnBatch{rt: rt, task: rt.task, slots: missing})
+		}
+	}
+	e.runtimeMu.Unlock()
+	e.deleteMu.RUnlock()
+
+	for _, b := range batches {
+		for _, slot := range b.slots {
+			s := slot
+			rt := b.rt
+			t := b.task
+			log.Printf("[engine] task %s scaling up: spawning work#%d (target=%d)", t.ID, s.idx, n)
+			runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, rt, t, s.idx, s.gen) })
+		}
+		b.task.Notify()
+	}
+}
+
+// ActiveWorkers returns the number of currently live worker goroutines for taskID.
+func (e *Engine) ActiveWorkers(taskID string) int {
+	if e == nil {
+		return 0
+	}
+	e.runtimeMu.Lock()
+	defer e.runtimeMu.Unlock()
+	rt := e.runtimes[taskID]
+	if rt == nil {
+		return 0
+	}
+	return len(rt.workers)
+}
+
+// shouldExitForScaleDown atomically checks whether worker slot idx exceeds the
+// current target worker count and, if so, unregisters this worker's generation
+// under runtimeMu so a concurrent ReconcileWorkers scale-up cannot mistake a
+// retiring goroutine for a live slot.
+func (e *Engine) shouldExitForScaleDown(rt *taskRuntime, idx int, gen uint64) (exit bool, target int) {
+	e.runtimeMu.Lock()
+	defer e.runtimeMu.Unlock()
+	target = e.desiredWorkers
+	if target <= 0 {
+		return false, target
+	}
+	if idx <= target {
+		return false, target
+	}
+	if rt != nil && rt.workers != nil && rt.workers[idx] == gen {
+		delete(rt.workers, idx)
+	}
+	return true, target
+}
+
+// unregisterWorker removes a worker slot on goroutine exit, guarded by its
+// generation token so a retiring worker can never clobber a newer worker spawned
+// into the same slot after a scale-down/scale-up bounce.
+func (e *Engine) unregisterWorker(rt *taskRuntime, idx int, gen uint64) {
+	e.runtimeMu.Lock()
+	if rt != nil && rt.workers != nil && rt.workers[idx] == gen {
+		delete(rt.workers, idx)
+	}
+	e.runtimeMu.Unlock()
+}
+
 // Run starts the planner loop + N worker loops for a task. The loops always run
 // but no-op until an LLM is configured (so a task created while idle picks up
 // automatically once LLM is set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
-	workers := e.m.Workers()
+	fallbackWorkers := e.initialWorkers()
 	e.deleteMu.RLock()
 	if e.IsDeleting(t.ID) {
 		e.deleteMu.RUnlock()
@@ -844,7 +1014,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		t.Notify() // already running — just nudge a planning round
 		return
 	}
-	rt := e.registerTaskRoutines(ctx, t.ID, 2+workers)
+	rt, slots := e.registerTaskStart(ctx, t, fallbackWorkers)
 	e.deleteMu.RUnlock()
 	if rt == nil {
 		e.started.Delete(t.ID)
@@ -853,9 +1023,9 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.claimSweepLoop(loopCtx, t) })
-	for i := 0; i < workers; i++ {
-		name := fmt.Sprintf("work#%d", i+1)
-		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
+	for _, slot := range slots {
+		s := slot
+		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, rt, t, s.idx, s.gen) })
 	}
 	e.startDeadlineCoordinator(ctx, t) // task-level timeout timer (only when timeout>0; deduplicated)
 	// Kick the first planning round only when there are no active intents at all
@@ -863,8 +1033,10 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	// worker just started above has claimed it as running first — both count as "work
 	// exists", so skip the first planner round: the worker runs the seed intent directly and NotifyDone/heartbeat wakes the planner when done.
 	// ⚠️ Do not use Frontier (counts only open): a worker claiming (open→running) races with this check and would kick spuriously. After a restart-driven auto-recovery only running intents may remain — skip then too.
-	if has, _ := t.Store.HasActiveIntent(); !has {
-		t.Notify() // kick the first planning round (acted on once LLM is ready)
+	if t.Store != nil {
+		if has, _ := t.Store.HasActiveIntent(); !has {
+			t.Notify() // kick the first planning round (acted on once LLM is ready)
+		}
 	}
 }
 
@@ -1144,12 +1316,18 @@ func startClaimHeartbeat(store *db.ExplorationStore, interval time.Duration, lab
 	return func() { close(quit); <-done }
 }
 
-func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
+func (e *Engine) workerLoop(ctx context.Context, rt *taskRuntime, t *Task, idx int, gen uint64) {
+	name := fmt.Sprintf("work#%d", idx)
+	defer e.unregisterWorker(rt, idx, gen)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+		}
+		if exit, target := e.shouldExitForScaleDown(rt, idx, gen); exit {
+			log.Printf("[worker %s] task %s scaling down (target=%d), exiting cleanly", name, t.ID, target)
+			return
 		}
 		_, worker := e.snapshotFor(t)
 		if worker == nil {

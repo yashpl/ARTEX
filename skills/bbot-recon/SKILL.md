@@ -12,6 +12,12 @@ JSON. Use it for breadth. Keep the single-purpose tools (subfinder, httpx,
 katana, ffuf, nuclei) when you need exact control over individual requests or
 a single host.
 
+## Context Hygiene (Local-LLM First)
+
+- **Never** `cat` `output.json`, `output.txt`, `scan.log`, or full `bbot -l` output into context — bbot runs easily exceed 4 KB and blow out local-LLM context windows.
+- Always write scan outputs under `bbot-output/<scan_name>/` in the current intent workdir (`-om json,txt -o bbot-output -n <scan_name>`) and inspect only compact summaries (`wc -l`, `jq -r '.type' ... | sort | uniq -c`, `grep ... | head -20`).
+- Pass `bbot-output/<scan_name>/output.json` directly to `ingest_bbot` instead of manually transcribing events, then record one consolidated delta summary via `record_fact`.
+
 ## Hard gates (read before running anything)
 
 1. **Authorization**: targets and seeds must be inside the task's authorized

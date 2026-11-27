@@ -87,6 +87,10 @@ Finding quality gates (proof standard, measured impact, testing bounds):
 - **Testing bounds** (bounded and non-destructive does NOT mean read-only): state-changing requests are in bounds when they are the finding's mechanism. Prove the mechanism on your own objects/accounts first, then confirm cross-entity reach on at most three non-owned objects with the smallest request that demonstrates the boundary; prefer reversible values, restore originals where possible, and record every touched object ID in the evidence.
 - **Priority discipline**: low-impact oracles (user/account enumeration, account-existence checks, response-timing differences) and low-yield misconfigurations (permissive CORS) are not standalone findings; record them only when they directly chain into account takeover, authentication bypass, or mass data exposure.
 
+Context hygiene & taxonomy (local-LLM discipline):
+- **File-first for large outputs**: redirect any command or HTTP response >4 KB to a file in the current workdir and inspect only targeted excerpts with ` + "`grep`" + `, ` + "`jq`" + `, or ` + "`head`/`tail`" + ` — never dump raw HTML, minified JS, or full scanner logs into context.
+- **Taxonomy lookup**: use ` + "`knowledge_lookup`" + ` with ` + "`attack`" + `, ` + "`wstg`" + `, ` + "`cwe`" + `, or ` + "`owasp-api`" + ` (OWASP API Security Top 10:2023) to pick tests and cite stable IDs in ` + "`record_fact`" + ` and ` + "`report_finding`" + `.
+
 Operator handoff on environmental blocks:
 - When a command or tool fails for an environmental reason (a sandboxed or filtered network path, a missing binary or key, TLS or proxy interception, a permission this runtime lacks), stop after the first failure: do not retry with different flags, do not switch tools hunting for a bypass, and do not fall through to an equivalent command.
 - Call ask_operator with the exact single command the operator should run in their own terminal: one line, copy-pastable, followed by what to paste back. One command per request; never batch. Wait for the reply instead of burning turns.`
@@ -126,7 +130,7 @@ First **accurately extract from the context the task_id, the exploration node no
 - ` + "`## Reproduction steps`" + `: **step-by-step operations that can be followed to reproduce** (requests/commands/parameters); include the PoC when available.
 - ` + "`## Evidence`" + `: key request/response excerpts, command output, echoes, or screenshot notes proving the vulnerability really exists — paste the originals in code blocks.
 - ` + "`## PoC`" + `: directly runnable/reusable exploit code or payloads (exploit script, request message, command line, payload string), **usually given as complete code in a code block** with a brief note on how to run it; when there is no standalone exploit code, state "the reproduction steps are the PoC".
-- ` + "`## Root cause analysis`" + `: why this vulnerability exists (missing validation / dangerous function / misconfiguration...).
+- ` + "`## Root cause analysis`" + `: why this vulnerability exists (missing validation / dangerous function / misconfiguration...); cite any verified ` + "`attack`" + `/` + "`wstg`" + `/` + "`cwe`" + `/` + "`owasp-api`" + ` ID from the evidence, never invent IDs.
 - ` + "`## Remediation`" + `: concrete, actionable fixes (not empty words); may include hardening and long-term recommendations.
 
 ━━ Discipline ━━
@@ -138,6 +142,20 @@ First **accurately extract from the context the task_id, the exploration node no
 - **Concise**: no boilerplate, no filler, no restating the template itself.
 - Write in **English** throughout. When done (update_finding_report succeeded), finish with one or two sentences stating which finding you wrote the report for.`
 
+// plannerLocalLLMDiscipline is appended to the planner's built-in seed so local
+// 20B-35B models use the full taxonomy pack (including owasp-api) and keep
+// context compact.
+const plannerLocalLLMDiscipline = "\n\n**Taxonomy & context discipline**:\n" +
+	"- `knowledge_lookup` supports `attack`, `wstg`, `cwe`, and `owasp-api` (OWASP API Security Top 10:2023). Use it to pick concrete test IDs when framing intents for web/API targets.\n" +
+	"- Keep context compact: never dump raw tool outputs (>4 KB) into reasoning; rely on `node_detail` and concise worker facts."
+
+// workerLocalLLMDiscipline is appended to the worker's built-in seed to enforce
+// file-first large-output hygiene and full taxonomy coverage (attack, wstg, cwe,
+// owasp-api) on 36K context windows.
+const workerLocalLLMDiscipline = "\n\n**Context hygiene & taxonomy (local-LLM discipline)**:\n" +
+	"- **File-first for large outputs**: redirect any command or HTTP response >4 KB to a file in the current intent workdir and inspect only targeted excerpts with `grep`, `jq`, or `head`/`tail` — never dump raw HTML, minified JS, or full scanner logs into context.\n" +
+	"- **Taxonomy lookup**: use `knowledge_lookup` with `attack`, `wstg`, `cwe`, or `owasp-api` (OWASP API Security Top 10:2023) to choose tests and cite stable IDs in `record_fact` and `report_finding`."
+
 // BuiltinPromptSeeds returns each built-in agent's default EDITABLE prompt body
 // keyed by agent key. The server seeds these into agent_prompts on startup (only
 // when an agent has no prompt yet), so the DB becomes the authoritative, editable
@@ -145,9 +163,9 @@ First **accurately extract from the context the task_id, the exploration node no
 func BuiltinPromptSeeds() map[string]string {
 	return map[string]string{
 		"goals":     goalsDefaultTmpl,
-		"planner":   plannerDefaultTmpl,
+		"planner":   plannerDefaultTmpl + plannerLocalLLMDiscipline,
 		"mainagent": mainAgentDefaultTmpl,
-		"worker":    workerDefaultTmpl,
+		"worker":    workerDefaultTmpl + workerLocalLLMDiscipline,
 		"auto":      autoDefaultTmpl,
 		"pentest":   pentestDefaultTmpl,
 	}

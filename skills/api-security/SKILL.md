@@ -1,6 +1,6 @@
 ---
 name: api-security
-description: "Invoke this skill when the task is authorized offensive testing of a REST, GraphQL, WebSocket, or SOAP API beyond recon: authentication and authorization flaws (BOLA, IDOR, BFLA), JWT and OAuth weaknesses, GraphQL-specific abuse, input validation, business logic, rate-limit trust confusion, and excessive data exposure."
+description: "Invoke this skill when the task is authorized offensive testing of a REST, GraphQL, WebSocket, or SOAP API beyond recon: OWASP API Top 10:2023 (owasp-api), authentication and authorization flaws (BOLA, IDOR, BFLA), JWT and OAuth weaknesses, GraphQL-specific abuse, input validation, business logic, rate-limit trust confusion, and excessive data exposure."
 ---
 
 # API Security Testing (REST, GraphQL, WebSocket, SOAP)
@@ -15,6 +15,11 @@ Attribution: adapted from the `api-security` playbook of [zhaoxuya520/reverse-sk
 - Do not exfiltrate real user data to prove a BOLA. One record you are authorized to touch, or your own second account, is sufficient evidence.
 - Destructive payloads (deletion, mass assignment on write endpoints) only against accounts and resources created for the test.
 - Every confirmed finding needs a replayable artifact: the exact request, the exact response, and the authorization context that produced it.
+
+## Context Hygiene & Taxonomy (Local-LLM First)
+
+- Save OpenAPI/Swagger specs, GraphQL introspection schemas, and HTTP responses `>4 KB` to files in the current intent workdir (`api_*.json` / `api_*.txt`), and inspect only targeted slices with `jq`, `grep`, or `head`/`tail` — never dump full specs or response bodies into context.
+- Use `knowledge_lookup` with `owasp-api` (OWASP API Security Top 10:2023), `wstg`, and `cwe` to pick concrete test cases and cite stable IDs in `record_fact` and `report_finding`.
 
 ## Phase checklists
 
