@@ -13,10 +13,10 @@ import (
 // workers. It has no task store dependency: the pack is embedded in the binary.
 func (t *ToolSet) knowledgeLookup() actool.CoreTool {
 	return readTool("knowledge_lookup",
-		"Look up a stable security taxonomy entry by id or keyword. Sources: attack (MITRE ATT&CK technique), wstg (OWASP Web Security Testing Guide test), cwe (MITRE Common Weakness Enumeration). Use it to choose a test or technique while planning, or to cite an id when reporting a finding or fact. Returns id, name, category, a capped description and the canonical url; truncated=true means the full text is at the url. Read-only.",
+		"Look up a stable security taxonomy entry by id or keyword. Sources: attack (MITRE ATT&CK technique), wstg (OWASP Web Security Testing Guide test), cwe (MITRE Common Weakness Enumeration), owasp-api (OWASP API Security Top 10:2023). Use it to choose a test or technique while planning, or to cite an id when reporting a finding or fact. Returns id, name, category, a capped description and the canonical url; truncated=true means the full text is at the url. Read-only.",
 		obj(map[string]any{
-			"source": str("taxonomy to search: attack, wstg or cwe"),
-			"query":  str("entry id (for example T1190, WSTG-ATHN-01, CWE-79) or keywords"),
+			"source": str("taxonomy to search: attack, wstg, cwe or owasp-api"),
+			"query":  str("entry id (for example T1190, WSTG-ATHN-01, CWE-79, API1:2023) or keywords"),
 			"limit":  intp("maximum matches, default 5, max 20"),
 		}, "source", "query"),
 		knowledgeLookupRun)

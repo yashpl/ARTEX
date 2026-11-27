@@ -66,3 +66,6 @@ posture-runs/
 
 # benchmark runner output (one dir per run)
 benchmark-results/
+
+# Local developer compose override (e.g. Windows Docker Desktop NTFS mount permissions)
+docker-compose.override.yml

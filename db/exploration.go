@@ -1317,6 +1317,19 @@ WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running'))`, s.e
 	return exists, err
 }
 
+// CountActiveIntents returns the count of open and running intents for this
+// exploration. Used by quiet-mode low-watermark refill so parallel worker slots
+// (e.g. local-LLM continuous batching) do not sit idle when open == 0 and
+// running < workers.
+func (s *ExplorationStore) CountActiveIntents() (open, running int, err error) {
+	err = s.db.QueryRow(`SELECT
+	COALESCE(SUM(CASE WHEN state='open' THEN 1 ELSE 0 END), 0),
+	COALESCE(SUM(CASE WHEN state='running' THEN 1 ELSE 0 END), 0)
+FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running')`, s.expID).Scan(&open, &running)
+	return open, running, err
+}
+
 // HasOpenGoal reports whether this exploration still has any goal in state 'open'.
 // false ⇒ all goals are met/abandoned (or the task has no goals) ⇒ enter the
 // goalless (human-dispatched) branch: the planner stops, and whether the task

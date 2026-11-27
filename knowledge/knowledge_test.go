@@ -17,10 +17,10 @@ func load(t *testing.T) *Pack {
 func TestLoadSources(t *testing.T) {
 	p := load(t)
 	names := p.SourceNames()
-	if len(names) != 3 {
-		t.Fatalf("sources = %v, want attack, cwe, wstg", names)
+	if len(names) != 4 {
+		t.Fatalf("sources = %v, want attack, cwe, owasp-api, wstg", names)
 	}
-	want := map[string]int{"attack": 600, "wstg": 100, "cwe": 900}
+	want := map[string]int{"attack": 600, "wstg": 100, "cwe": 900, "owasp-api": 10}
 	for _, name := range names {
 		info, ok := p.SourceInfo(name)
 		if !ok {
@@ -43,6 +43,7 @@ func TestLookupExact(t *testing.T) {
 		{"attack", "T1190", "Exploit Public-Facing Application"},
 		{"wstg", "WSTG-ATHN-01", "Default Credentials"},
 		{"cwe", "CWE-79", "Improper Neutralization of Input During Web Page Generation"},
+		{"owasp-api", "API1:2023", "Broken Object Level Authorization"},
 	}
 	for _, c := range cases {
 		e, ok := p.Lookup(c.source, c.id)

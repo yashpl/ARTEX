@@ -891,8 +891,10 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 
 // quietSkipEdge reports whether an edge-triggered planning round should be
 // dropped (#79): the open-goal set is unchanged since the last completed round
-// AND active work exists (open or running intents). Fails open (false) on any
-// store error: when in doubt, plan, preserving the pre-quiet-mode behavior.
+// AND either queued open intents remain OR all worker slots are already busy.
+// When open == 0 and running < workers, we allow the edge wake-up so the
+// planner refills the frontier and keeps parallel local-LLM slots saturated.
+// Fails open (false) on any store error: when in doubt, plan.
 func (e *Engine) quietSkipEdge(t *Task) bool {
 	fp, err := t.Store.OpenGoalFingerprint()
 	if err != nil {
@@ -901,8 +903,32 @@ func (e *Engine) quietSkipEdge(t *Task) bool {
 	if last, ok := e.goalFP.Load(t.ID); !ok || last != fp {
 		return false
 	}
-	active, err := t.Store.HasActiveIntent()
-	return err == nil && active
+	open, running, err := t.Store.CountActiveIntents()
+	if err != nil {
+		return false
+	}
+	workers := e.m.Workers()
+	if workers <= 0 {
+		workers = 1
+	}
+	return open > 0 || running >= workers
+}
+
+// isTransientKVOverflow identifies shared-KV-pool contention errors from local
+// LLM servers (llama.cpp / llama-server --kv-unified) when concurrent slots
+// momentarily exhaust the unified KV cache. Single-request size errors
+// ("request (N tokens) exceeds the available context size") are excluded so an
+// oversized single prompt does not spin in an open/claim loop.
+func isTransientKVOverflow(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "exceeds the available context size") {
+		return false
+	}
+	return strings.Contains(msg, "context size has been exceeded") ||
+		strings.Contains(msg, "failed to find free space in the kv cache")
 }
 
 // plannerGateContext tags a planning round's context for the target gate: the
@@ -1391,6 +1417,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// (so the planner knows this direction was tried but not truly finished and needs a different angle, instead of skipping it forever as covered); error → blocked; normal → done.
 	state := "done"
 	switch {
+	case err != nil && isTransientKVOverflow(err):
+		// Shared unified-KV contention on a local LLM server (llama-server):
+		// return the intent to open instead of permanently blocking it so it
+		// can be re-claimed cleanly once concurrent KV pressure clears.
+		state = "open"
+		log.Printf("[worker %s] intent %d hit transient local-LLM KV overflow; returning to open", name, intent.ID)
 	case err != nil:
 		state = "blocked"
 	case reason == harness.ReasonMaxTurns:

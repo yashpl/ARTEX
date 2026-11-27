@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -253,6 +254,11 @@ func FromEnv() (Config, bool) {
 		// Streaming by default; ARTEX_LLM_STREAM=false/0/off explicitly switches to
 		// non-streaming.
 		Stream: !isFalsy(os.Getenv("ARTEX_LLM_STREAM")),
+	}
+	if rawK := strings.TrimSpace(os.Getenv("ARTEX_LLM_CONTEXT_WINDOW_K")); rawK != "" {
+		if k, err := strconv.Atoi(rawK); err == nil && k > 0 {
+			c.ContextWindowK = k
+		}
 	}
 	switch prov {
 	case "openai":

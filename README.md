@@ -38,8 +38,11 @@ justify it, and every autonomous action passes through scope rules, approval gat
   findings, evidence quotes and retests are tied to the exact request/response.
 - **Autonomy with brakes.** Human-in-the-loop approvals, argv-prefix rules, scope/deny gates,
   token and turn budgets, a target noise governor, and prompt-injection framing on tool output.
-- **Self-hosted and model-agnostic.** One Go binary with the Next.js UI embedded, PostgreSQL,
-  your own Anthropic/OpenAI-compatible endpoint, or a local Ollama.
+- **Optimized for local LLMs (`llama-server` / Ollama).** Tuned for continuous-batching local
+  inference with GBNF-safe tool schemas, low-watermark frontier refill for parallel slots,
+  transient unified-KV overflow recovery, `ARTEX_LLM_CONTEXT_WINDOW_K` compaction control,
+  file-first skills, and an extended embedded knowledge pack (`attack`, `wstg`, `cwe`, `owasp-api`).
+  See the [Local-LLM Optimization Guide](docs/local-llm-optimization.md).
 
 ---
 

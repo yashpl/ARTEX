@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-//go:embed data/attack.json data/wstg.json data/cwe.json
+//go:embed data/attack.json data/wstg.json data/cwe.json data/owasp-api.json
 var dataFS embed.FS
 
 // Entry is one taxonomy record. Descriptions are capped by the build script;
@@ -70,7 +70,7 @@ func Default() (*Pack, error) {
 // that want to fail before the first lookup.
 func Load() (*Pack, error) {
 	p := &Pack{sources: map[string]*source{}}
-	for _, name := range []string{"attack", "wstg", "cwe"} {
+	for _, name := range []string{"attack", "wstg", "cwe", "owasp-api"} {
 		raw, err := dataFS.ReadFile("data/" + name + ".json")
 		if err != nil {
 			return nil, fmt.Errorf("knowledge: read %s: %w", name, err)

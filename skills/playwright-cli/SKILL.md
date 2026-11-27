@@ -1,6 +1,6 @@
 ---
 name: playwright-cli
-description: Automate browser interactions, test web pages and work with Playwright tests.
+description: "Invoke this skill whenever a task requires headless Chromium browser automation: rendering JS-heavy SPAs, inspecting DOM/console/network traffic, testing forms/cookies/storage, or verifying client-side behavior. Prefer --raw eval and targeted find/snapshot --depth=4 to keep local-LLM contexts compact."
 allowed-tools: Bash(playwright-cli:*) Bash(npx:*) Bash(npm:*)
 ---
 

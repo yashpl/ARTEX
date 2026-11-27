@@ -1,6 +1,6 @@
 ---
 name: api-recon
-description: Invoke this skill when collecting a website's API endpoints.
+description: "Invoke this skill when mapping a website's backend API endpoints, frontend SPA/MPA routes, request parameters, and UI feature triggers. Uses scripted static bundle harvesting plus credential-free runtime mocking so large JS bundles stay out of local-LLM context."
 ---
 
 # API Recon (frontend API reconnaissance)
