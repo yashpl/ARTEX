@@ -3,7 +3,7 @@
 The chat bot lets an operator talk to ARTEX from a chat app instead of the web UI. Telegram is the
 first transport. This page describes the bridge core: connecting a bot, the chat allowlist and how
 updates are processed. Task commands, the main-agent conversation and remote approvals build on it
-([issue #5](https://github.com/BaaRai/ARTEX/issues/5)).
+([issue #5](https://github.com/yashpl/ARTEX/issues/5)).
 
 Outbound notifications (pushing findings to a chat) are a separate feature under
 **System → Notifications** and keep working without the bot.

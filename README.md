@@ -10,10 +10,10 @@
 Self-hosted multi-agent offensive security. A planner explores, workers run real tools,
 and every finding stays bound to the assets and HTTP traffic that prove it.
 
-[![Release](https://img.shields.io/github/v/release/BaaRai/ARTEX?label=release&color=6b34db)](https://github.com/BaaRai/ARTEX/releases)
-[![License](https://img.shields.io/github/license/BaaRai/ARTEX?color=6b34db)](LICENSE)
-[![CI](https://github.com/BaaRai/ARTEX/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/BaaRai/ARTEX/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/github/go-mod/go-version/BaaRai/ARTEX?color=6b34db)](go.mod)
+[![Release](https://img.shields.io/github/v/release/yashpl/ARTEX?label=release&color=6b34db)](https://github.com/yashpl/ARTEX/releases)
+[![License](https://img.shields.io/github/license/yashpl/ARTEX?color=6b34db)](LICENSE)
+[![CI](https://github.com/yashpl/ARTEX/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/yashpl/ARTEX/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/github/go-mod/go-version/yashpl/ARTEX?color=6b34db)](go.mod)
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/VKyvMTcgXh)
 
 [Quick start](#quick-start) · [Screenshots](#screenshots) · [How it works](#how-it-works) · [Install](#installation) · [Configuration](#configuration) · [Security](SECURITY.md)
@@ -46,7 +46,7 @@ justify it, and every autonomous action passes through scope rules, approval gat
 ## Quick start
 
 ```bash
-git clone https://github.com/BaaRai/ARTEX.git
+git clone https://github.com/yashpl/ARTEX.git
 cd ARTEX
 cp .env.example .env            # set POSTGRES_PASSWORD (and optionally an LLM key)
 docker compose up -d --build    # builds from this checkout, starts PostgreSQL
@@ -60,7 +60,7 @@ docker compose logs artex | grep "Setup token"
 ```
 
 > Multi-arch release images (`linux/amd64`, `linux/arm64`) are published to GitHub Container
-> Registry at `ghcr.io/baarai/artex` from the next tagged release; v0.7.0 predates the publish
+> Registry at `ghcr.io/yashpl/artex` from the next tagged release; v0.7.0 predates the publish
 > step. For pulling the prebuilt image and all other installation paths (script, binaries,
 > source, release archives), see [Installation](#installation).
 
@@ -319,7 +319,7 @@ worker remains confined to the intent it claimed.
 ### Option 1: one-click install script (recommended)
 
 ```bash
-git clone https://github.com/BaaRai/ARTEX.git
+git clone https://github.com/yashpl/ARTEX.git
 cd ARTEX
 ./install.sh
 ```
@@ -340,7 +340,7 @@ first-run claim), or keep loopback and use a reverse proxy or SSH tunnel.
 Build from a checkout with Docker Compose:
 
 ```bash
-git clone https://github.com/BaaRai/ARTEX.git
+git clone https://github.com/yashpl/ARTEX.git
 cd ARTEX
 cp .env.example .env            # set POSTGRES_PASSWORD, optionally ANTHROPIC_API_KEY
 docker compose up -d --build
@@ -369,7 +369,7 @@ Set the `ARTEX_PG_*` variables below. The example uses Docker Desktop's
 the reachable hostname of your database server.
 
 ```bash
-docker pull ghcr.io/baarai/artex:latest
+docker pull ghcr.io/yashpl/artex:latest
 
 mkdir -p data keys
 docker run -d --name artex \
@@ -385,7 +385,7 @@ docker run -d --name artex \
   -e ARTEX_JWT_KEY_DIR=/app/keys \
   -v "$PWD/data:/app/data" \
   -v "$PWD/keys:/app/keys" \
-  ghcr.io/baarai/artex:latest
+  ghcr.io/yashpl/artex:latest
 # → http://localhost:8787  (docker logs artex | grep "Setup token")
 ```
 
@@ -407,8 +407,8 @@ checkout build above until the next tagged release. Once the first image is publ
 the file and `.env.example` once:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/BaaRai/ARTEX/main/docker-compose.ghcr.yml
-curl -fsSLO https://raw.githubusercontent.com/BaaRai/ARTEX/main/.env.example
+curl -fsSLO https://raw.githubusercontent.com/yashpl/ARTEX/main/docker-compose.ghcr.yml
+curl -fsSLO https://raw.githubusercontent.com/yashpl/ARTEX/main/.env.example
 cp .env.example .env            # set POSTGRES_PASSWORD, optionally an LLM key
 docker compose -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.ghcr.yml up -d
@@ -432,7 +432,7 @@ Legacy SSE servers usually establish the event stream with `GET /sse` and receiv
 
 ### Option 3: prebuilt binaries (Releases)
 
-Download the zip for your platform from [Releases](https://github.com/BaaRai/ARTEX/releases). It
+Download the zip for your platform from [Releases](https://github.com/yashpl/ARTEX/releases). It
 contains `artex`, `start.sh` (`start.bat` on Windows), `skills/` and `config.example.json`:
 
 ```bash
@@ -452,7 +452,7 @@ neither.
 
 ```bash
 sha256sum -c SHA256SUMS                           # add --ignore-missing if you downloaded only some zips
-gh attestation verify <zip> --repo BaaRai/ARTEX   # built by this repository's release workflow
+gh attestation verify <zip> --repo yashpl/ARTEX   # built by this repository's release workflow
 ```
 
 ### Option 4: build the single binary from source
@@ -626,7 +626,7 @@ service, the `depends_on` block, and the `pgdata` volume from `docker-compose.ym
 ```yaml
 services:
   artex:
-    image: ghcr.io/baarai/artex:latest
+    image: ghcr.io/yashpl/artex:latest
     security_opt:
       - "no-new-privileges:true"
     environment:
@@ -841,8 +841,8 @@ docker compose up -d artex
 docker image prune -f            # optional
 ```
 
-If running the prebuilt `ghcr.io/baarai/artex` container directly, pull the new tag (`docker pull
-ghcr.io/baarai/artex:latest` or a pinned `:v<version>`) and recreate the container with the same
+If running the prebuilt `ghcr.io/yashpl/artex` container directly, pull the new tag (`docker pull
+ghcr.io/yashpl/artex:latest` or a pinned `:v<version>`) and recreate the container with the same
 `/app/data` and `/app/keys` mounts. If you run the prebuilt Compose stack, the update is:
 
 ```bash
@@ -891,7 +891,7 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 ARTEX is an **LLM multi-agent-driven autonomous penetration testing system**: a Go monolithic
 backend (with the Next.js UI embedded) + PostgreSQL. Agent capabilities come from the
-[`norma`](https://github.com/Autumn-27/norma) SDK (`agentcore` / `tool` / `permission` / `harness` /
+[`norma`](https://github.com/yashpl/Norma) SDK (`agentcore` / `tool` / `permission` / `harness` /
 `memory` / `transcript`). At its core is the **dual-graph architecture**, plus two autonomy
 mechanisms: **process-level information exchange between workers** and the **planner's multi-round
 shared todolist**.
